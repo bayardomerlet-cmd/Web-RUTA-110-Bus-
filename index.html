@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Ruta 110 | Bus + Admin</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <link rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@300;400;600;700;800&display=swap" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />
+  <link rel="stylesheet" href="styles.css" />
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+
+<body>
+  <header class="header">
+    <div class="logo">🚌 RUTA 110 | Bus + Admin</div>
+    <div class="header-info">
+      <span id="estadoGPS">📍 GPS: Inactivo</span>
+      <span id="reloj">--:--:--</span>
+    </div>
+  </header>
+
+  <div class="main-container">
+    <aside class="sidebar">
+      <div class="panel">
+        <h3><i class="fas fa-comments"></i> Chat</h3>
+        <div class="chat-container">
+          <div class="reglas-chat"><i class="fas fa-shield-alt"></i> ⚠️ No se permiten palabras con insulto este chat es
+            para fines informativo</div>
+          <div id="chatDisplay" class="chat-display">
+            <div class="msg admin"><b>🚌 Central:</b> ¡Bienvenido!</div>
+          </div>
+          <div class="chat-input-area">
+            <input type="text" id="chatInput" placeholder="Escribe..." autocomplete="off">
+            <button id="sendBtn"><i class="fas fa-paper-plane"></i></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3><i class="fas fa-user-circle"></i> Mi Cuenta</h3>
+        <div id="userStatus" style="font-size:0.7rem;">🔴 No registrado</div>
+        <div id="userAliasDisplay" style="font-size:0.6rem; color:#6b7280;"></div>
+        <div id="userBlockStatus" style="font-size:0.6rem; margin-top:5px;"></div>
+        <button id="btnRegistroNuevo" class="btn btn-primary">➕ Registrarse</button>
+        <button id="btnCambiarUsuario" class="btn btn-warning">🔄 Cambiar</button>
+      </div>
+
+      <div class="panel">
+        <h3><i class="fas fa-satellite-dish"></i> Mi Ubicación</h3>
+        <div id="gpsStatusDisplay" class="gps-status gps-inactive">📡 GPS: Inactivo</div>
+        <button id="btnActivarGPS" class="btn btn-success">📍 Activar GPS</button>
+        <button id="btnCentrarGPS" class="btn btn-primary">🎯 Centrar</button>
+      </div>
+
+      <div class="panel">
+        <h3><i class="fas fa-search-location"></i> Bus Cercano</h3>
+        <button id="btnBusCercano" class="btn btn-cercano"><i class="fas fa-bus"></i> ¿Qué bus está más cerca?</button>
+        <div id="resultadoCercano" class="resultado-card" style="display:none;">
+          <div class="titulo"><i class="fas fa-chart-line"></i> INFORMACIÓN EN TIEMPO REAL</div>
+          <div class="info-line"><i class="fas fa-bus"></i> <span id="cercanoBus">---</span></div>
+          <div class="info-line"><i class="fas fa-road"></i> <span id="cercanoDistancia">---</span></div>
+          <div class="info-line"><i class="fas fa-clock"></i> <span id="cercanoTiempo">---</span></div>
+          <div class="resultado-divider"></div>
+          <div class="info-line"><i class="fas fa-map-marker-alt"></i> <strong>Parada más cercana:</strong></div>
+          <div class="info-line"><span id="paradaNombre">---</span></div>
+          <div class="info-line"><i class="fas fa-walking"></i> <span id="paradaDistancia">---</span></div>
+          <div class="resultado-divider"></div>
+          <div id="sugerencia" class="sugerencia"><i class="fas fa-lightbulb"></i> Calculando sugerencia...</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3><i class="fas fa-users"></i> Usuarios</h3>
+        <div id="listaUsuarios" style="max-height: 100px; overflow-y: auto;"></div>
+      </div>
+
+      <div class="panel">
+        <h3><i class="fas fa-map-pin"></i> Paradas</h3>
+        <div id="listaParadas" class="lista-paradas">Cargando...</div>
+      </div>
+
+      <div class="panel">
+        <h3><i class="fas fa-terminal"></i> Telemetría</h3>
+        <div id="consola">🚀 Listo</div>
+      </div>
+    </aside>
+
+    <main class="map-container">
+      <div class="toolbar">
+        <div class="selector-buses">🚌 Buses:
+          <select id="cantidadBusesSelect">
+            <option value="0">0</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4" selected>4</option>
+            <option value="5">5</option>
+            <option value="6">6</option>
+            <option value="7">7</option>
+            <option value="8">8</option>
+            <option value="9">9</option>
+            <option value="10">10</option>
+          </select>
+        </div>
+
+        <div class="selector-velocidad">⚡ Velocidad
+          <select id="velocidadSelect">
+            <option value="0.1">Lenta</option>
+            <option value="0.6" selected>Normal</option>
+            <option value="1">Rápida</option>
+            <option value="1.5">Muy rápida</option>
+          </select>
+        </div>
+
+        <button id="btnIniciarSimulacion"><i class="fas fa-play"></i> Iniciar</button>
+        <button id="btnDetenerSimulacion"><i class="fas fa-stop"></i> Detener</button>
+        <button id="btnVerRuta"><i class="fas fa-route"></i> Ruta</button>
+        <button id="toggleRutaBtn" style="background:#8b5cf6;"><i class="fas fa-eye"></i> Ruta ON</button>
+        <button id="openAdminBtn" style="background:#ef4444;"><i class="fas fa-shield-alt"></i> Admin</button>
+        <button id="btnSonidoOn" style="background:#10b981;"><i class="fas fa-volume-up"></i> Sonido ON</button>
+        <button id="btnSonidoOff" style="background:#6b7280;"><i class="fas fa-volume-mute"></i> Sonido OFF</button>
+        <div id="notificacion"
+          style="flex:1; font-size:0.6rem; background:#2d3748; padding:4px 8px; border-radius:16px;">ℹ️ Activa GPS</div>
+      </div>
+
+      <div id="map"></div>
+
+      <div id="telemetryPanel" class="telemetry-panel">
+        <div class="telemetry-header" id="toggleTelemetry">
+          <span><i class="fas fa-chart-line"></i> TELEMETRÍA</span>
+          <i id="toggleIcon" class="fas fa-chevron-up"></i>
+        </div>
+        <div id="telemetryContent" class="telemetry-content">
+          <div style="text-align:center; padding:20px;"><i class="fas fa-bus"></i><br>Inicia simulación</div>
+        </div>
+        <div class="telemetry-footer">Actualización real</div>
+      </div>
+    </main>
+  </div>
+
+  <div id="registerModal" class="modal">
+    <div class="modal-content">
+      <h2>📝 Registro</h2>
+      <input type="text" id="userAlias" placeholder="Alias" autocomplete="off">
+      <input type="tel" id="phoneNumber" placeholder="Número" autocomplete="off">
+      <button id="registerBtn" class="btn-primary">REGISTRARSE</button>
+      <div id="registerError" class="error"></div>
+    </div>
+  </div>
+
+  <div id="cambiarUsuarioModal" class="modal">
+    <div class="modal-content">
+      <h2>🔄 Cambiar Usuario</h2>
+      <div id="listaUsuariosCambio" style="max-height:250px; overflow-y:auto; margin:10px 0;"></div>
+      <button id="cancelarCambioBtn" class="btn-danger">Cancelar</button>
+    </div>
+  </div>
+
+  <div id="loginAdminModal" class="login-admin">
+    <div class="login-content">
+      <h2 style="color:#ef4444;">🔐 Acceso Admin</h2>
+      <input type="password" id="adminPassword" placeholder="Contraseña">
+      <button id="loginAdminSubmit" class="btn-primary">INGRESAR</button>
+      <div id="loginError" class="error"></div>
+    </div>
+  </div>
+
+  <div id="adminPanel" class="admin-panel">
+    <button class="admin-close" id="closeAdminBtn">✖ Cerrar</button>
+    <div id="adminRoot"></div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+
+</html>
