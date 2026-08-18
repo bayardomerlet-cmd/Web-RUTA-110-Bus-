@@ -1,8 +1,11 @@
 let currentUser = null;
 let usuariosRegistrados = [];
 let usuariosBloqueados = [];
+let conductoresRegistrados = [];
+let watchIdsConductores = {};
 let watchId = null;
 let map = null;
+
 let userMarker = null;
 let userLocation = null;
 let markersUsuarios = {};
@@ -98,10 +101,62 @@ function estaBloqueado(telefono) { return usuariosBloqueados.some(b => b.telefon
 function guardarUsuarios() {
   localStorage.setItem('ruta110_usuarios_final', JSON.stringify(usuariosRegistrados));
   localStorage.setItem('ruta110_bloqueados_final', JSON.stringify(usuariosBloqueados));
+  if (currentUser) {
+    localStorage.setItem('ruta110_current_user', JSON.stringify(currentUser));
+  } else {
+    localStorage.removeItem('ruta110_current_user');
+  }
+
+  if (window.FirebaseDB && window.FirebaseSDK) {
+    try {
+      const { doc, setDoc } = window.FirebaseSDK;
+      usuariosRegistrados.forEach(u => {
+        const id = u.telefono ? String(u.telefono) : ('usr_' + Math.random());
+        setDoc(doc(window.FirebaseDB, "usuarios", id), u, { merge: true });
+      });
+      usuariosBloqueados.forEach(b => {
+        const id = b.telefono ? String(b.telefono) : ('blq_' + Math.random());
+        setDoc(doc(window.FirebaseDB, "bloqueados", id), b, { merge: true });
+      });
+    } catch (e) {
+      console.warn("Error guardando usuarios en Firebase:", e);
+    }
+  }
+}
+
+function guardarConductores() {
+  localStorage.setItem('ruta110_conductores', JSON.stringify(conductoresRegistrados));
+
+  if (window.FirebaseDB && window.FirebaseSDK) {
+    try {
+      const { doc, setDoc } = window.FirebaseSDK;
+      conductoresRegistrados.forEach(c => {
+        const id = c.id ? String(c.id) : (c.nombre ? c.nombre.replace(/\s+/g, '_') : ('cond_' + Math.random()));
+        setDoc(doc(window.FirebaseDB, "conductores", id), c, { merge: true });
+      });
+    } catch (e) {
+      console.warn("Error guardando conductores en Firebase:", e);
+    }
+  }
 }
 
 function guardarUbicaciones() {
   localStorage.setItem('ruta110_ubicaciones_final', JSON.stringify(ubicacionesUsuarios));
+
+  if (window.FirebaseDB && window.FirebaseSDK) {
+    try {
+      const { doc, setDoc } = window.FirebaseSDK;
+      Object.keys(ubicacionesUsuarios).forEach(tel => {
+        setDoc(doc(window.FirebaseDB, "ubicaciones", String(tel)), {
+          telefono: tel,
+          ...ubicacionesUsuarios[tel],
+          updatedAt: Date.now()
+        }, { merge: true });
+      });
+    } catch (e) {
+      console.warn("Error guardando ubicaciones en Firebase:", e);
+    }
+  }
 }
 
 function guardarHistorial() {
@@ -117,8 +172,25 @@ function cargarDatos() {
   if (loc) ubicacionesUsuarios = JSON.parse(loc);
   const hist = localStorage.getItem('ruta110_historial_recorridos');
   if (hist) historialRecorridos = JSON.parse(hist);
+  const cond = localStorage.getItem('ruta110_conductores');
+  if (cond) conductoresRegistrados = JSON.parse(cond);
   const sonidoOn = localStorage.getItem('ruta110_sonido_on');
   sonidoHabilitado = sonidoOn !== 'false';
+
+  // Cargar usuario activo persistido
+  const cur = localStorage.getItem('ruta110_current_user');
+  if (cur) {
+    const tempUser = JSON.parse(cur);
+    const exists = usuariosRegistrados.find(usr => usr.telefono === tempUser.telefono);
+    if (exists) {
+      currentUser = exists;
+    } else {
+      currentUser = null;
+    }
+  } else {
+    currentUser = null;
+  }
+
   actualizarListaUsuarios();
 }
 
@@ -156,14 +228,132 @@ function enviarMensaje(texto) {
   if (palabra) {
     usuariosBloqueados.push({ telefono: currentUser.telefono, alias: currentUser.alias, motivo: `Palabra prohibida: "${palabra}"`, fecha: Date.now() });
     guardarUsuarios();
-    mostrarMensaje({ perfil: "Sistema", mensaje: `⚠️ "${currentUser.alias}" ha sido BLOQUEADO. Motivo: ${palabra}`, timestamp: Date.now(), alias: "Sistema", esAdvertencia: true });
+    mostrarMensaje({ perfil: "Sistema", mensaje: ` "${currentUser.alias}" ha sido BLOQUEADO. Motivo: ${palabra}`, timestamp: Date.now(), alias: "Sistema", esAdvertencia: true });
     return false;
   }
-  const nuevoMensaje = { perfil: "Pasajero", mensaje: texto, timestamp: Date.now(), telefono: currentUser.telefono, alias: currentUser.alias };
+  const nuevoMensaje = { 
+    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+    perfil: "Pasajero", 
+    mensaje: texto, 
+    timestamp: Date.now(), 
+    telefono: currentUser.telefono, 
+    alias: currentUser.alias 
+  };
+  
+  // Guardar y mostrar en memoria local
   mensajesLocales.push(nuevoMensaje);
   mostrarMensaje(nuevoMensaje);
+
+  // Enviar a Firebase Firestore si está disponible
+  if (window.FirebaseDB && window.FirebaseSDK) {
+    const { collection, addDoc } = window.FirebaseSDK;
+    addDoc(collection(window.FirebaseDB, "mensajes"), nuevoMensaje).then(() => {
+      console.log("✅ Mensaje enviado a Firestore con éxito");
+    }).catch(err => {
+      console.error("❌ Error al guardar en Firebase Firestore:", err);
+      mostrarMensaje({
+        perfil: "Sistema",
+        mensaje: `⚠️ Error de envío en Firebase: ${err.message}. (Si dice 'permission-denied', activa 'Modo de Prueba' en las Reglas de Firestore Database).`,
+        timestamp: Date.now(),
+        alias: "Sistema",
+        esAdvertencia: true
+      });
+    });
+  }
   return true;
 }
+
+let loadedMsgIds = new Set();
+let firebaseSyncIniciado = false;
+
+function initFirebaseSync() {
+  if (firebaseSyncIniciado) return;
+  if (!window.FirebaseDB || !window.FirebaseSDK) {
+    return;
+  }
+  firebaseSyncIniciado = true;
+  console.log("📡 Conectando Chat a Firebase Firestore...");
+  try {
+    const { collection, onSnapshot } = window.FirebaseSDK;
+    const mensajesRef = collection(window.FirebaseDB, "mensajes");
+
+    // 1. Escuchar Chat
+    onSnapshot(mensajesRef, (snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === "added") {
+          const msgData = change.doc.data();
+          const msgId = change.doc.id || msgData.id;
+          if (msgId && !loadedMsgIds.has(msgId)) {
+            loadedMsgIds.add(msgId);
+            const yaExiste = mensajesLocales.some(m => 
+              m.id === msgData.id || 
+              (m.timestamp === msgData.timestamp && m.alias === msgData.alias && m.mensaje === msgData.mensaje)
+            );
+            if (!yaExiste) {
+              mensajesLocales.push(msgData);
+              mostrarMensaje(msgData);
+            }
+          }
+        }
+      });
+    }, (error) => {
+      console.error("❌ Error de Firestore Chat:", error);
+    });
+
+    // 2. Escuchar Usuarios registrados (para Panel Admin)
+    onSnapshot(collection(window.FirebaseDB, "usuarios"), (snapshot) => {
+      let actualizado = false;
+      snapshot.forEach(docSnap => {
+        const data = docSnap.data();
+        const idx = usuariosRegistrados.findIndex(u => String(u.telefono) === String(data.telefono));
+        if (idx >= 0) {
+          usuariosRegistrados[idx] = { ...usuariosRegistrados[idx], ...data };
+        } else {
+          usuariosRegistrados.push(data);
+          actualizado = true;
+        }
+      });
+      if (actualizado) {
+        actualizarListaUsuarios();
+        if (typeof actualizarAdminDatos === 'function') actualizarAdminDatos();
+      }
+    });
+
+    // 3. Escuchar Conductores registrados (para Panel Admin)
+    onSnapshot(collection(window.FirebaseDB, "conductores"), (snapshot) => {
+      let actualizado = false;
+      snapshot.forEach(docSnap => {
+        const data = docSnap.data();
+        const idx = conductoresRegistrados.findIndex(c => String(c.id || c.nombre) === String(data.id || data.nombre));
+        if (idx >= 0) {
+          conductoresRegistrados[idx] = { ...conductoresRegistrados[idx], ...data };
+        } else {
+          conductoresRegistrados.push(data);
+          actualizado = true;
+        }
+      });
+      if (actualizado) {
+        if (typeof actualizarTodosLosMarcadores === 'function') actualizarTodosLosMarcadores();
+        if (typeof actualizarAdminDatos === 'function') actualizarAdminDatos();
+      }
+    });
+
+    // 4. Escuchar Usuarios Bloqueados
+    onSnapshot(collection(window.FirebaseDB, "bloqueados"), (snapshot) => {
+      snapshot.forEach(docSnap => {
+        const data = docSnap.data();
+        if (!usuariosBloqueados.some(b => String(b.telefono) === String(data.telefono))) {
+          usuariosBloqueados.push(data);
+        }
+      });
+      if (typeof actualizarAdminDatos === 'function') actualizarAdminDatos();
+    });
+  } catch (err) {
+    console.error("❌ Excepción inicializando Firebase Sync:", err);
+  }
+}
+
+window.addEventListener('firebaseReady', initFirebaseSync);
 
 function handleSendMessage() {
   const input = document.getElementById('chatInput');
@@ -247,17 +437,14 @@ window.cambiarAUsuario = function (telefono) {
   if (!usuario) return;
   if (watchId) { navigator.geolocation.clearWatch(watchId); watchId = null; }
   currentUser = usuario;
+  guardarUsuarios();
+  actualizarInterfazUsuario();
+  actualizarListaUsuarios();
 
   if (guidRutaPolyline && map) {
     map.removeLayer(guidRutaPolyline);
     guidRutaPolyline = null;
   }
-  document.getElementById('userStatus').innerHTML = `🟢 ${usuario.alias}`;
-  document.getElementById('userAliasDisplay').innerHTML = `🔒 Teléfono privado`;
-  document.getElementById('userBlockStatus').innerHTML = estaBloqueado(usuario.telefono)
-    ? '<span style="color:#ef4444;">⛔ BLOQUEADO</span>'
-    : '';
-  actualizarListaUsuarios();
 
   // Actualizar todos los marcadores en el mapa y cambiar íconos/popups
   actualizarTodosLosMarcadores();
@@ -270,11 +457,11 @@ window.cambiarAUsuario = function (telefono) {
 
     const gpsDisplay = document.getElementById('gpsStatusDisplay');
     if (gpsDisplay) {
-      gpsDisplay.innerHTML = `📍 GPS activo`;
+      gpsDisplay.innerHTML = `GPS activo`;
       gpsDisplay.className = 'gps-status gps-active';
     }
     const estadoGPS = document.getElementById('estadoGPS');
-    if (estadoGPS) estadoGPS.innerHTML = '📍 GPS: Activo';
+    if (estadoGPS) estadoGPS.innerHTML = 'GPS: Activo';
   } else {
     userLocation = null;
 
@@ -284,24 +471,92 @@ window.cambiarAUsuario = function (telefono) {
       gpsDisplay.className = 'gps-status gps-inactive';
     }
     const estadoGPS = document.getElementById('estadoGPS');
-    if (estadoGPS) estadoGPS.innerHTML = '📍 GPS: Inactivo';
+    if (estadoGPS) estadoGPS.innerHTML = ' GPS: Inactivo';
   }
 
+  actualizarNotificacionProximidad();
   document.getElementById('cambiarUsuarioModal')?.classList.remove('active');
 };
+
+function actualizarInterfazUsuario() {
+  const btnRegistro = document.getElementById('btnRegistroNuevo');
+  const btnRegresar = document.getElementById('btnRegresarCuenta');
+
+  if (currentUser) {
+    document.getElementById('userStatus').innerHTML = `🟢 ${currentUser.alias}`;
+    document.getElementById('userAliasDisplay').innerHTML = `🔒 Teléfono privado`;
+    document.getElementById('userBlockStatus').innerHTML = estaBloqueado(currentUser.telefono)
+      ? '<span style="color:#ef4444;">⛔ BLOQUEADO</span>'
+      : '';
+
+    if (btnRegistro) btnRegistro.style.display = 'none';
+    if (btnRegresar) btnRegresar.style.display = 'block';
+  } else {
+    document.getElementById('userStatus').innerHTML = `🔴 No registrado`;
+    document.getElementById('userAliasDisplay').innerHTML = ``;
+    document.getElementById('userBlockStatus').innerHTML = ``;
+
+    if (btnRegistro) btnRegistro.style.display = 'block';
+    if (btnRegresar) btnRegresar.style.display = 'none';
+  }
+}
+
+function cerrarSesionUsuario() {
+  currentUser = null;
+  guardarUsuarios();
+  if (watchId) {
+    navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+  }
+  if (userMarker && map) {
+    map.removeLayer(userMarker);
+    userMarker = null;
+  }
+
+  actualizarInterfazUsuario();
+  actualizarListaUsuarios();
+  actualizarTodosLosMarcadores();
+
+  if (guidRutaPolyline && map) {
+    map.removeLayer(guidRutaPolyline);
+    guidRutaPolyline = null;
+  }
+
+  const gpsDisplay = document.getElementById('gpsStatusDisplay');
+  if (gpsDisplay) {
+    gpsDisplay.innerHTML = `📡 GPS: Inactivo`;
+    gpsDisplay.className = 'gps-status gps-inactive';
+  }
+  const estadoGPS = document.getElementById('estadoGPS');
+  if (estadoGPS) estadoGPS.innerHTML = ' GPS: Inactivo';
+
+  log(" Sesión cerrada.");
+}
 
 function actualizarTodosLosMarcadores() {
   if (!map) return;
 
-  // Eliminar marcadores de usuarios que ya no existen o no tienen ubicación
-  Object.keys(markersUsuarios).forEach(tel => {
-    if (!usuariosRegistrados.some(u => u.telefono === tel) || !ubicacionesUsuarios[tel]) {
-      map.removeLayer(markersUsuarios[tel]);
-      delete markersUsuarios[tel];
+  // 1. Eliminar marcadores huérfanos de pasajeros y de conductores (desactivados o eliminados)
+  Object.keys(markersUsuarios).forEach(key => {
+    if (key.startsWith('driver_')) {
+      const condId = key.replace('driver_', '');
+      const cond = conductoresRegistrados.find(c => c.id === condId);
+      const gpsActivo = !!watchIdsConductores[condId];
+      if (!cond || !ubicacionesUsuarios[cond.telefono] || !gpsActivo) {
+        map.removeLayer(markersUsuarios[key]);
+        delete markersUsuarios[key];
+      }
+    } else {
+      // Pasajero
+      const tel = key;
+      if (!usuariosRegistrados.some(u => u.telefono === tel) || !ubicacionesUsuarios[tel]) {
+        map.removeLayer(markersUsuarios[tel]);
+        delete markersUsuarios[tel];
+      }
     }
   });
 
-  // Dibujar o actualizar marcadores para todos los usuarios con ubicación
+  // 2. Dibujar o actualizar marcadores para todos los usuarios con ubicación
   usuariosRegistrados.forEach(u => {
     const loc = ubicacionesUsuarios[u.telefono];
     if (loc) {
@@ -337,7 +592,45 @@ function actualizarTodosLosMarcadores() {
       }
     }
   });
+
+  // 3. Dibujar o actualizar marcadores para todos los conductores con ubicación y GPS activo
+  conductoresRegistrados.forEach(c => {
+    const loc = ubicacionesUsuarios[c.telefono];
+    const gpsActivo = !!watchIdsConductores[c.id];
+    if (loc && gpsActivo) {
+      const markerKey = `driver_${c.id}`;
+      const popupText = `
+        <div class="driver-popup" style="color:#f0f9ff; background:#1a1f3a; padding: 5px; border-radius: 8px; font-family: 'Inter', sans-serif;">
+          <div style="display:flex; gap:10px; align-items:center; min-width: 180px;">
+            ${c.foto ? `<img src="${c.foto}" style="width:40px; height:40px; border-radius:50%; object-fit:cover; border:2px solid #ef4444;">` : `<div style="width:40px; height:40px; border-radius:50%; background:#2d3748; display:flex; align-items:center; justify-content:center;"><i class="fas fa-user-tie" style="color:#ef4444; font-size:1.5rem;"></i></div>`}
+            <div>
+              <strong style="color:#00d2ff; font-size:0.80rem;">Conductor: ${c.nombre}</strong><br>
+              <span style="font-size:0.65rem; color:#9ca3af;">📞 Tel: ${c.telefono}</span>
+            </div>
+          </div>
+          <div style="margin-top:6px; border-top:1px solid #2d3748; padding-top:4px; font-size:0.65rem;">
+            Unidad: <b>${c.unidad}</b><br>
+            Placa: <b>${c.placa}</b><br>
+            🪪 ID: <b>${c.identidad}</b>
+          </div>
+        </div>
+      `;
+
+      if (markersUsuarios[markerKey]) {
+        markersUsuarios[markerKey].setLatLng([loc.lat, loc.lng]);
+        markersUsuarios[markerKey].setPopupContent(popupText);
+        markersUsuarios[markerKey].setIcon(crearIconoConductor(c));
+      } else {
+        const marker = L.marker([loc.lat, loc.lng], {
+          icon: crearIconoConductor(c)
+        }).addTo(map);
+        marker.bindPopup(popupText);
+        markersUsuarios[markerKey] = marker;
+      }
+    }
+  });
 }
+
 
 function cargarListaUsuariosCambio() {
   const cont = document.getElementById('listaUsuariosCambio');
@@ -389,7 +682,7 @@ function actualizarGlobosPorBuses() {
         const el = marker.getElement();
         if (el) el.classList.add('pin-verde');
         if (marker.getTooltip()) marker.closeTooltip();
-        marker.bindTooltip(`🚌 ${getBusNombre(idxBus)} llegó a ${parada.nombre}`, {
+        marker.bindTooltip(` ${getBusNombre(idxBus)} llegó a ${parada.nombre}`, {
           permanent: false,
           direction: 'top',
           className: 'tooltip-parada',
@@ -401,9 +694,9 @@ function actualizarGlobosPorBuses() {
           if (el) el.classList.remove('pin-verde');
         }, 2000);
         reproducirSonidoParada(parada.nombre);
-        log(`🚌 ${getBusNombre(idxBus)} llegó a ${parada.nombre}`);
+        log(` ${getBusNombre(idxBus)} llegó a ${parada.nombre}`);
         const noti = document.getElementById('notificacion');
-        if (noti) noti.innerHTML = `🚌 Simulación activa`;
+        if (noti && !userLocation) noti.innerHTML = ` Simulación activa`;
         break;
       }
     }
@@ -500,6 +793,7 @@ function moverBuses() {
   });
   actualizarTelemetria();
   actualizarGlobosPorBuses();
+  actualizarNotificacionProximidad();
 }
 
 function iniciarSimulacionConCantidad() {
@@ -520,8 +814,9 @@ function iniciarSimulacionConCantidad() {
   simActive = true;
   actualizarTelemetria();
   const noti = document.getElementById('notificacion');
-  if (noti) noti.innerHTML = `🚌 Simulación activa con ${cantidad} unidades`;
-  log(`▶ Simulación iniciada con ${cantidad} buses`);
+  if (noti && !userLocation) noti.innerHTML = ` Simulación activa con ${cantidad} unidades`;
+  if (userLocation) actualizarNotificacionProximidad();
+  log(` Simulación iniciada con ${cantidad} buses`);
 }
 
 function detenerSimulacion() {
@@ -529,7 +824,15 @@ function detenerSimulacion() {
   if (simInterval) clearInterval(simInterval);
   simInterval = null;
   const noti = document.getElementById('notificacion');
-  if (noti) noti.innerHTML = '⏹ Simulación detenida';
+  if (noti) {
+    if (userLocation) {
+      actualizarNotificacionProximidad();
+    } else {
+      noti.innerHTML = '⏹ Simulación detenida';
+      noti.style.background = '#2d3748';
+      noti.style.color = '#ffffff';
+    }
+  }
   log('⏹ Simulación detenida');
 }
 
@@ -564,7 +867,7 @@ function reproducirSonidoParada(paradaNombre) {
 
   if ('speechSynthesis' in window) {
     speechSynthesis.cancel();
-    const msg = new SpeechSynthesisUtterance(`parada: ${paradaNombre}`);
+    const msg = new SpeechSynthesisUtterance(paradaNombre);
     msg.voice = vozElegida || null;
     msg.lang = vozElegida?.lang || 'es-ES';
     msg.rate = 0.95;
@@ -575,8 +878,8 @@ function reproducirSonidoParada(paradaNombre) {
 }
 
 function buscarInfoCompleta() {
-  if (!userLocation) { alert('⚠️ Primero activa tu GPS'); return; }
-  if (!simActive || arregloBuses.length === 0) { alert('🚌 No hay buses en simulación'); return; }
+  if (!userLocation) { alert(' Primero activa tu GPS'); return; }
+  if (!simActive || arregloBuses.length === 0) { alert(' No hay buses en simulación'); return; }
 
   let busCercano = null;
   let distanciaMinimaBus = Infinity;
@@ -635,6 +938,80 @@ function buscarInfoCompleta() {
   map.fitBounds(bounds, { padding: [50, 50] });
 }
 
+function actualizarNotificacionProximidad() {
+  const noti = document.getElementById('notificacion');
+  if (!noti) return;
+
+  if (!userLocation) {
+    noti.innerHTML = `ℹ️ Activa GPS`;
+    noti.style.background = '#2d3748';
+    noti.style.color = '#ffffff';
+    return;
+  }
+
+  if (!simActive || arregloBuses.length === 0) {
+    noti.innerHTML = `⏹ Simulación inactiva`;
+    noti.style.background = '#2d3748';
+    noti.style.color = '#ffffff';
+    return;
+  }
+
+  // 1. Encontrar la parada más cercana a la ubicación del usuario
+  let paradaUsuario = null;
+  let distMinParada = Infinity;
+  paradasRuta110.forEach(p => {
+    const d = calcularDistancia(userLocation.lat, userLocation.lng, p.lat, p.lng);
+    if (d < distMinParada) {
+      distMinParada = d;
+      paradaUsuario = p;
+    }
+  });
+
+  if (!paradaUsuario) {
+    noti.innerHTML = `📍 GPS Activo | Buscando paradas...`;
+    noti.style.background = '#2d3748';
+    noti.style.color = '#ffffff';
+    return;
+  }
+
+  // 2. Encontrar el bus más cercano a la parada del usuario
+  let busCercano = null;
+  let distMinBus = Infinity;
+  arregloBuses.forEach((bus, idx) => {
+    const d = calcularDistancia(bus.lat, bus.lng, paradaUsuario.lat, paradaUsuario.lng);
+    if (d < distMinBus) {
+      distMinBus = d;
+      busCercano = { nombre: bus.nombre || getBusNombre(idx), distancia: d };
+    }
+  });
+
+  if (!busCercano) {
+    noti.innerHTML = `📍 Parada: ${paradaUsuario.nombre} | Buscando buses...`;
+    noti.style.background = '#2d3748';
+    noti.style.color = '#ffffff';
+    return;
+  }
+
+  const distBusTexto = busCercano.distancia < 1000
+    ? `${Math.round(busCercano.distancia)} m`
+    : `${(busCercano.distancia / 1000).toFixed(1)} km`;
+
+  // 3. Actualizar el contenido y estilo según la distancia
+  if (busCercano.distancia < 150) {
+    noti.innerHTML = `🚨 ¡${busCercano.nombre} llegando a tu parada (${paradaUsuario.nombre})!`;
+    noti.style.background = '#ef4444'; // Rojo llamativo
+    noti.style.color = '#ffffff';
+  } else if (busCercano.distancia < 500) {
+    noti.innerHTML = ` ${busCercano.nombre} está cerca de tu parada (${paradaUsuario.nombre}) - a ${distBusTexto}`;
+    noti.style.background = '#10b981'; // Verde llamativo
+    noti.style.color = '#ffffff';
+  } else {
+    noti.innerHTML = ` ${busCercano.nombre} a ${distBusTexto} de tu parada (${paradaUsuario.nombre})`;
+    noti.style.background = '#2d3748'; // Gris por defecto
+    noti.style.color = '#ffffff';
+  }
+}
+
 function actualizarTelemetria() {
   const telemetryContent = document.getElementById('telemetryContent');
   if (!telemetryContent) return;
@@ -679,19 +1056,28 @@ function activarGPSReal(ignorarConfirmacion) {
   if (ignorarConfirmacion !== true) {
     const deseaActivar = confirm("¿Deseas permitir que la aplicación acceda y comparta la ubicación para el número de teléfono " + currentUser.telefono + "?");
     if (!deseaActivar) {
-      log("🚫 Compartir ubicación cancelado por el usuario.");
+      log(" Compartir ubicación cancelado por el usuario.");
       return;
     }
   }
 
+  const gpsDisplay = document.getElementById('gpsStatusDisplay');
+  if (gpsDisplay) {
+    gpsDisplay.innerHTML = `⏳ GPS: Buscando señal...`;
+    gpsDisplay.className = 'gps-status gps-searching';
+  }
+  const estadoGPS = document.getElementById('estadoGPS');
+  if (estadoGPS) estadoGPS.innerHTML = '⏳ GPS: Buscando...';
+
   log('📍 Solicitando GPS...');
   if (watchId) navigator.geolocation.clearWatch(watchId);
 
-  navigator.geolocation.getCurrentPosition(() => {
-    watchId = navigator.geolocation.watchPosition((pos) => {
+  function iniciarLocalizacion(altaPrecision) {
+    navigator.geolocation.getCurrentPosition((pos) => {
       userLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude };
       ubicacionesUsuarios[currentUser.telefono] = userLocation;
       guardarUbicaciones();
+
       if (document.getElementById('adminPanel')?.classList.contains('active') && typeof actualizarAdminDatos === 'function') {
         actualizarAdminDatos();
       }
@@ -703,19 +1089,50 @@ function activarGPSReal(ignorarConfirmacion) {
         window.ubicacionCentrada = true;
       }
 
-      const gpsDisplay = document.getElementById('gpsStatusDisplay');
       if (gpsDisplay) {
         gpsDisplay.innerHTML = `📍 GPS activo`;
         gpsDisplay.className = 'gps-status gps-active';
       }
-      const estadoGPS = document.getElementById('estadoGPS');
       if (estadoGPS) estadoGPS.innerHTML = '📍 GPS: Activo';
-    }, (e) => {
-      log(`❌ GPS error: ${e.message}`);
-    }, { enableHighAccuracy: true, timeout: 10000 });
-  }, () => {
-    alert('Permiso denegado');
-  });
+      actualizarNotificacionProximidad();
+
+      // Comenzar seguimiento continuo de movimiento
+      watchId = navigator.geolocation.watchPosition((watchPos) => {
+        userLocation = { lat: watchPos.coords.latitude, lng: watchPos.coords.longitude };
+        ubicacionesUsuarios[currentUser.telefono] = userLocation;
+        guardarUbicaciones();
+        if (document.getElementById('adminPanel')?.classList.contains('active') && typeof actualizarAdminDatos === 'function') {
+          actualizarAdminDatos();
+        }
+        actualizarTodosLosMarcadores();
+
+        if (gpsDisplay) {
+          gpsDisplay.innerHTML = `📍 GPS activo`;
+          gpsDisplay.className = 'gps-status gps-active';
+        }
+        if (estadoGPS) estadoGPS.innerHTML = '📍 GPS: Activo';
+        actualizarNotificacionProximidad();
+      }, (e) => {
+        log(`❌ GPS Watch error: ${e.message}`);
+      }, { enableHighAccuracy: altaPrecision, timeout: 10000 });
+
+    }, (err) => {
+      log(`❌ GPS error inicial (altaPrecision=${altaPrecision}): ${err.message}`);
+      if (altaPrecision) {
+        log('⚠️ Intentando con precisión estándar (fallback)...');
+        iniciarLocalizacion(false);
+      } else {
+        alert('Permiso de ubicación denegado o error de GPS.');
+        if (gpsDisplay) {
+          gpsDisplay.innerHTML = `📡 GPS: Inactivo`;
+          gpsDisplay.className = 'gps-status gps-inactive';
+        }
+        if (estadoGPS) estadoGPS.innerHTML = '📍 GPS: Inactivo';
+      }
+    }, { enableHighAccuracy: altaPrecision, timeout: 10000 });
+  }
+
+  iniciarLocalizacion(true);
 }
 
 function centrarEnMiUbicacion() {
@@ -724,6 +1141,41 @@ function centrarEnMiUbicacion() {
     log('🎯 Centrado');
   } else {
     alert('Activa GPS');
+  }
+}
+
+function cerrarYRestablecerRegistro() {
+  document.getElementById('registerModal')?.classList.remove('active');
+
+  const err = document.getElementById('registerError');
+  if (err) err.textContent = '';
+
+  const success = document.getElementById('registerSuccess');
+  if (success) {
+    success.textContent = '';
+    success.style.display = 'none';
+  }
+
+  const ua = document.getElementById('userAlias');
+  if (ua) {
+    ua.value = '';
+    ua.style.display = 'block';
+  }
+
+  const pn = document.getElementById('phoneNumber');
+  if (pn) {
+    pn.value = '';
+    pn.style.display = 'block';
+  }
+
+  const registerBtn = document.getElementById('registerBtn');
+  if (registerBtn) {
+    registerBtn.style.display = 'block';
+  }
+
+  const cancelBtn = document.getElementById('cancelarRegistroBtn');
+  if (cancelBtn) {
+    cancelBtn.textContent = 'REGRESAR';
   }
 }
 
@@ -739,30 +1191,42 @@ function registrarNuevoUsuario() {
     if (error) error.textContent = 'Ese número ya existe.';
     return;
   }
+
   const nuevo = { alias, telefono };
   usuariosRegistrados.push(nuevo);
   currentUser = nuevo;
   guardarUsuarios();
+
   if (document.getElementById('adminPanel')?.classList.contains('active') && typeof actualizarAdminDatos === 'function') {
     actualizarAdminDatos();
   }
+
   actualizarListaUsuarios();
+  actualizarInterfazUsuario();
   if (error) error.textContent = '';
-  document.getElementById('registerModal')?.classList.remove('active');
 
-  // Solicitar compartir ubicación
-  setTimeout(() => {
-    solicitarCompartirUbicacion();
-  }, 300);
-}
+  // Solicitar GPS inmediatamente para no perder el contexto de gesto del usuario
+  activarGPSReal(true);
 
-function solicitarCompartirUbicacion() {
-  if (!currentUser) return;
-  const deseaCompartir = confirm("¿Deseas compartir tu ubicación para el número de teléfono " + currentUser.telefono + "?");
-  if (deseaCompartir) {
-    activarGPSReal(true);
-  } else {
-    log("🚫 Compartir ubicación cancelado por el usuario.");
+  // Mostrar interfaz de éxito en el modal de registro
+  const success = document.getElementById('registerSuccess');
+  if (success) {
+    success.innerHTML = `¡Registro Exitoso!<br><span style="font-size:0.65rem; font-weight:normal; color:#cbd5e1;">Se ha solicitado acceso a tu ubicación GPS.</span>`;
+    success.style.display = 'block';
+  }
+
+  const ua = document.getElementById('userAlias');
+  if (ua) ua.style.display = 'none';
+
+  const pn = document.getElementById('phoneNumber');
+  if (pn) pn.style.display = 'none';
+
+  const registerBtn = document.getElementById('registerBtn');
+  if (registerBtn) registerBtn.style.display = 'none';
+
+  const cancelBtn = document.getElementById('cancelarRegistroBtn');
+  if (cancelBtn) {
+    cancelBtn.textContent = 'REGRESAR AL MAPA';
   }
 }
 
@@ -772,6 +1236,14 @@ function abrirAdmin() {
 
 function cerrarAdmin() {
   document.getElementById('adminPanel')?.classList.remove('active');
+}
+
+function cerrarLoginAdmin() {
+  document.getElementById('loginAdminModal')?.classList.remove('active');
+  const pass = document.getElementById('adminPassword');
+  if (pass) pass.value = '';
+  const err = document.getElementById('loginError');
+  if (err) err.textContent = '';
 }
 
 function loginAdmin() {
@@ -802,6 +1274,7 @@ window.mostrarAdminPanel = function () {
         <button class="admin-tab-btn" id="btn-tab-moderacion" onclick="switchAdminTab('moderacion')"><i class="fas fa-comments"></i> Moderación de Chat</button>
         <button class="admin-tab-btn" id="btn-tab-simulacion" onclick="switchAdminTab('simulacion')"><i class="fas fa-bus"></i> Control de Simulación</button>
         <button class="admin-tab-btn" id="btn-tab-tiempos" onclick="switchAdminTab('tiempos')"><i class="fas fa-clock"></i> Tiempos y Recorridos</button>
+        <button class="admin-tab-btn" id="btn-tab-conductores" onclick="switchAdminTab('conductores')"><i class="fas fa-id-card"></i> Registro de Conductores</button>
       </nav>
 
       <!-- PESTAÑA: RESUMEN -->
@@ -932,6 +1405,64 @@ window.mostrarAdminPanel = function () {
         </div>
       </div>
 
+      <!-- PESTAÑA: REGISTRO DE CONDUCTORES -->
+      <div id="tab-conductores" class="admin-tab-content">
+        <div class="admin-card">
+          <div class="admin-card-title"><i class="fas fa-user-plus"></i> Registrar Nuevo Conductor</div>
+          <form id="form-registro-conductor" onsubmit="event.preventDefault(); registrarConductor();">
+            <div class="admin-grid-two-cols">
+              <div class="admin-input-group">
+                <label for="cond-nombre">Nombre Completo del Conductor</label>
+                <input type="text" id="cond-nombre" required placeholder="Ej. Juan Pérez">
+              </div>
+              <div class="admin-input-group">
+                <label for="cond-identidad">Número de Identidad</label>
+                <input type="text" id="cond-identidad" required placeholder="Ej. 001-121290-0002A">
+              </div>
+            </div>
+            
+            <div class="admin-grid-two-cols" style="margin-top: 10px;">
+              <div class="admin-input-group">
+                <label for="cond-unidad">Número de Unidad</label>
+                <input type="text" id="cond-unidad" required placeholder="Ej. 110-U01">
+              </div>
+              <div class="admin-input-group">
+                <label for="cond-placa">Número de Placa del Bus</label>
+                <input type="text" id="cond-placa" required placeholder="Ej. M 12345">
+              </div>
+            </div>
+            
+            <div class="admin-grid-two-cols" style="margin-top: 10px;">
+              <div class="admin-input-group">
+                <label for="cond-telefono">Número de Teléfono</label>
+                <input type="tel" id="cond-telefono" required placeholder="Ej. 88888888">
+              </div>
+              <div class="admin-input-group">
+                <label>Foto Actual del Conductor</label>
+                <div style="display: flex; gap: 15px; align-items: center;">
+                  <input type="file" id="cond-foto" accept="image/*" style="display: none;" onchange="previewConductorFoto(event)">
+                  <button type="button" class="admin-btn admin-btn-secondary" onclick="document.getElementById('cond-foto').click()"><i class="fas fa-upload"></i> Subir Foto</button>
+                  <div id="cond-foto-preview-container" class="cond-photo-preview-circle">
+                    <i class="fas fa-user" id="cond-foto-placeholder" style="color: #9ca3af; font-size: 1.5rem;"></i>
+                    <img id="cond-foto-preview" style="display: none; width: 100%; height: 100%; object-fit: cover;">
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            
+            <button type="submit" class="admin-btn admin-btn-primary" style="margin-top: 15px;"><i class="fas fa-save"></i> Registrar Conductor</button>
+          </form>
+        </div>
+
+        <div class="admin-card">
+          <div class="admin-card-title"><i class="fas fa-address-book"></i> Conductores Registrados</div>
+          <div class="admin-list-container" id="admin-lista-conductores" style="max-height: 400px; overflow-y: auto;">
+            <!-- Contenido dinámico -->
+          </div>
+        </div>
+      </div>
+
     </div>
   `;
 
@@ -972,11 +1503,12 @@ window.actualizarAdminDatos = function () {
               <strong>👤 ${u.alias}</strong>
               <span class="user-meta">📞 ${u.telefono} | 📍 ${coordText}</span>
             </div>
-            <div>
+            <div style="display:flex; gap:6px; align-items:center;">
               ${bloqueado
             ? `<button class="admin-btn admin-btn-secondary" style="padding:4px 8px;" onclick="desbloquearUsuarioAdmin('${u.telefono.replace(/'/g, "\\'")}')">Desbloquear</button>`
             : `<button class="admin-btn admin-btn-danger" style="padding:4px 8px;" onclick="bloquearUsuarioAdmin('${u.telefono.replace(/'/g, "\\'")}', 'Baneo manual del Administrador')">Bloquear</button>`
           }
+              <button class="admin-btn admin-btn-danger" style="padding:4px 8px; background:#b91c1c;" onclick="eliminarUsuarioAdmin('${u.telefono.replace(/'/g, "\\'")}')"><i class="fas fa-trash-alt"></i> Eliminar</button>
             </div>
           </div>
         `;
@@ -1072,7 +1604,49 @@ window.actualizarAdminDatos = function () {
       `;
     }
   }
+
+  const condList = document.getElementById('admin-lista-conductores');
+  if (condList) {
+    if (conductoresRegistrados.length === 0) {
+      condList.innerHTML = '<div style="padding:15px; text-align:center; color:#9ca3af;">No hay conductores registrados</div>';
+    } else {
+      condList.innerHTML = conductoresRegistrados.map(c => {
+        const fotoHTML = c.foto
+          ? `<img src="${c.foto}" style="width:50px; height:50px; border-radius:50%; object-fit:cover; border:1px solid #2d3748;">`
+          : `<div style="width:50px; height:50px; border-radius:50%; background:#2d3748; display:flex; align-items:center; justify-content:center;"><i class="fas fa-user" style="color:#9ca3af; font-size:1.2rem;"></i></div>`;
+
+        const gpsActivo = !!watchIdsConductores[c.id];
+        const gpsBadgeHTML = gpsActivo
+          ? `<span class="admin-badge admin-badge-active" style="margin-left: 5px;">📡 GPS Activo</span>`
+          : `<span class="admin-badge admin-badge-blocked" style="background: rgba(107, 114, 128, 0.2); color: #9ca3af; margin-left: 5px;">📡 GPS Inactivo</span>`;
+
+        const gpsBtnHTML = gpsActivo
+          ? `<button class="admin-btn admin-btn-secondary" style="padding:4px 8px;" onclick="activarGPSConductor('${c.id}')"><i class="fas fa-satellite-dish"></i> Apagar GPS</button>`
+          : `<button class="admin-btn admin-btn-success" style="padding:4px 8px; background:#10b981;" onclick="activarGPSConductor('${c.id}')"><i class="fas fa-satellite-dish"></i> Activar GPS</button>`;
+
+        return `
+          <div class="admin-list-item" style="padding: 12px 15px;">
+            <div style="display:flex; gap:12px; align-items:center;">
+              ${fotoHTML}
+              <div class="user-details">
+                <div style="display:flex; align-items:center; flex-wrap:wrap;">
+                  <strong style="font-size: 0.85rem; color: #f0f9ff;">${c.nombre}</strong>
+                  ${gpsBadgeHTML}
+                </div>
+                <span class="user-meta" style="font-size: 0.65rem;">📞 Tel: ${c.telefono} | 🪪 ID: ${c.identidad} | 🚌 Unidad: ${c.unidad} | 🏷️ Placa: ${c.placa}</span>
+              </div>
+            </div>
+            <div style="display:flex; gap:6px;">
+              ${gpsBtnHTML}
+              <button class="admin-btn admin-btn-danger" style="padding:4px 8px; background:#b91c1c;" onclick="eliminarConductorAdmin('${c.id}')"><i class="fas fa-trash-alt"></i> Eliminar</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+  }
 };
+
 
 window.bloquearUsuarioAdmin = function (telefono, motivo = 'Baneo manual') {
   const user = usuariosRegistrados.find(u => u.telefono === telefono);
@@ -1117,6 +1691,38 @@ window.desbloquearUsuarioAdmin = function (telefono) {
   actualizarListaUsuarios();
 };
 
+window.eliminarUsuarioAdmin = function (telefono) {
+  const user = usuariosRegistrados.find(u => u.telefono === telefono);
+  const alias = user ? user.alias : 'Usuario Desconocido';
+  if (confirm(`¿Estás seguro de que deseas eliminar al usuario "${alias}" (${telefono})?`)) {
+    if (currentUser && currentUser.telefono === telefono) {
+      cerrarSesionUsuario();
+    }
+
+    usuariosRegistrados = usuariosRegistrados.filter(u => u.telefono !== telefono);
+    usuariosBloqueados = usuariosBloqueados.filter(b => b.telefono !== telefono);
+    delete ubicacionesUsuarios[telefono];
+
+    if (markersUsuarios[telefono]) {
+      if (map) map.removeLayer(markersUsuarios[telefono]);
+      delete markersUsuarios[telefono];
+    }
+
+    guardarUsuarios();
+    guardarUbicaciones();
+
+    const infoMsg = { perfil: "Central", mensaje: `❌ El usuario "${alias}" ha sido eliminado por la administración.`, timestamp: Date.now(), alias: "Central" };
+    mensajesLocales.push(infoMsg);
+    mostrarMensaje(infoMsg);
+
+    log(`🗑️ Usuario ${alias} (${telefono}) eliminado por el administrador.`);
+
+    actualizarAdminDatos();
+    actualizarListaUsuarios();
+    actualizarTodosLosMarcadores();
+  }
+};
+
 window.enviarAnuncioCentral = function () {
   const textarea = document.getElementById('admin-broadcast-msg');
   const txt = textarea ? textarea.value.trim() : '';
@@ -1144,6 +1750,9 @@ window.eliminarTodosLosUsuarios = function () {
       navigator.geolocation.clearWatch(watchId);
       watchId = null;
     }
+    Object.values(watchIdsConductores).forEach(id => navigator.geolocation.clearWatch(id));
+    watchIdsConductores = {};
+
 
     Object.values(markersUsuarios).forEach(m => map.removeLayer(m));
     markersUsuarios = {};
@@ -1153,9 +1762,7 @@ window.eliminarTodosLosUsuarios = function () {
       guidRutaPolyline = null;
     }
 
-    document.getElementById('userStatus').innerHTML = `🔴 No registrado`;
-    document.getElementById('userAliasDisplay').innerHTML = ``;
-    document.getElementById('userBlockStatus').innerHTML = ``;
+    actualizarInterfazUsuario();
 
     const gpsDisplay = document.getElementById('gpsStatusDisplay');
     if (gpsDisplay) {
@@ -1406,7 +2013,7 @@ window.exportarExcelRecorridos = function () {
   XLSX.utils.book_append_sheet(workbook, worksheet, 'Recorridos');
 
   XLSX.writeFile(workbook, `Reporte_Recorridos_Ruta110_${new Date().toISOString().slice(0, 10)}.xlsx`);
-  log('📊 Reporte de recorridos exportado a Excel');
+  log(' Reporte de recorridos exportado a Excel');
 };
 
 window.limpiarHistorialRecorridos = function () {
@@ -1414,7 +2021,7 @@ window.limpiarHistorialRecorridos = function () {
     historialRecorridos = [];
     guardarHistorial();
     actualizarAdminDatos();
-    log('🧹 Historial de recorridos limpiado');
+    log(' Historial de recorridos limpiado');
   }
 };
 
@@ -1452,6 +2059,8 @@ function bindEventos() {
     sendBtn: handleSendMessage,
     btnRegistroNuevo: () => document.getElementById('registerModal')?.classList.add('active'),
     registerBtn: registrarNuevoUsuario,
+    cancelarRegistroBtn: cerrarYRestablecerRegistro,
+    btnRegresarCuenta: cerrarSesionUsuario,
     btnCambiarUsuario: abrirCambioUsuario,
     cancelarCambioBtn: () => document.getElementById('cambiarUsuarioModal')?.classList.remove('active'),
     btnActivarGPS: activarGPSReal,
@@ -1461,6 +2070,7 @@ function bindEventos() {
       iniciarSimulacionConCantidad();
       if (simInterval) clearInterval(simInterval);
       simInterval = setInterval(moverBuses, 1200);
+      actualizarNotificacionProximidad();
     },
     btnDetenerSimulacion: detenerSimulacion,
     btnVerRuta: centrarRuta,
@@ -1469,6 +2079,7 @@ function bindEventos() {
     btnSonidoOn: activarSonido,
     btnSonidoOff: desactivarSonido,
     loginAdminSubmit: loginAdmin,
+    cancelarAdminBtn: cerrarLoginAdmin,
     closeAdminBtn: cerrarAdmin,
     toggleTelemetry: toggleTelemetryPanel
   };
@@ -1486,6 +2097,143 @@ function bindEventos() {
   }
 }
 
+window.previewConductorFoto = function (event) {
+  const file = event.target.files[0];
+  if (file) {
+    const reader = new FileReader();
+    reader.onload = function (e) {
+      const preview = document.getElementById('cond-foto-preview');
+      const placeholder = document.getElementById('cond-foto-placeholder');
+      if (preview && placeholder) {
+        preview.src = e.target.result;
+        preview.style.display = 'block';
+        placeholder.style.display = 'none';
+      }
+    };
+    reader.readAsDataURL(file);
+  }
+};
+
+window.registrarConductor = function () {
+  const nombre = document.getElementById('cond-nombre')?.value.trim();
+  const identidad = document.getElementById('cond-identidad')?.value.trim();
+  const unidad = document.getElementById('cond-unidad')?.value.trim();
+  const placa = document.getElementById('cond-placa')?.value.trim();
+  const telefono = document.getElementById('cond-telefono')?.value.trim();
+  const preview = document.getElementById('cond-foto-preview');
+
+  if (!nombre || !identidad || !unidad || !placa || !telefono) {
+    alert('Por favor complete todos los datos.');
+    return;
+  }
+
+  let foto = '';
+  if (preview && preview.style.display === 'block') {
+    foto = preview.src; // base64 string
+  }
+
+  const nuevoConductor = {
+    id: Date.now().toString(),
+    nombre,
+    identidad,
+    unidad,
+    placa,
+    telefono,
+    foto
+  };
+
+  conductoresRegistrados.push(nuevoConductor);
+  guardarConductores();
+
+  // Limpiar formulario
+  document.getElementById('form-registro-conductor')?.reset();
+  if (preview) {
+    preview.src = '';
+    preview.style.display = 'none';
+  }
+  const placeholder = document.getElementById('cond-foto-placeholder');
+  if (placeholder) {
+    placeholder.style.display = 'block';
+  }
+
+  actualizarAdminDatos();
+  alert('Conductor registrado con éxito.');
+};
+
+window.eliminarConductorAdmin = function (id) {
+  if (confirm('¿Estás seguro de que deseas eliminar este conductor?')) {
+    const cond = conductoresRegistrados.find(c => c.id === id);
+    if (cond) {
+      if (watchIdsConductores[id]) {
+        navigator.geolocation.clearWatch(watchIdsConductores[id]);
+        delete watchIdsConductores[id];
+      }
+      delete ubicacionesUsuarios[cond.telefono];
+      guardarUbicaciones();
+    }
+
+    conductoresRegistrados = conductoresRegistrados.filter(c => c.id !== id);
+    guardarConductores();
+    actualizarAdminDatos();
+    actualizarTodosLosMarcadores();
+  }
+};
+
+function crearIconoConductor(c) {
+  const fotoHTML = c.foto
+    ? `<img src="${c.foto}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover; border: 2px solid #ef4444;">`
+    : `<div style="width: 32px; height: 32px; border-radius: 50%; background: #ef4444; display: flex; align-items: center; justify-content: center;"><i class="fas fa-user-tie" style="color: white; font-size: 1rem;"></i></div>`;
+
+  return L.divIcon({
+    html: `
+      <div class="driver-marker-wrapper" style="display: flex; flex-direction: column; align-items: center; background: transparent;">
+        <div class="driver-label" style="background: #ef4444; color: white; font-size: 8px; font-weight: 800; padding: 2px 6px; border-radius: 10px; margin-bottom: 2px; white-space: nowrap; border: 1px solid #1a1f3a; box-shadow: 0 2px 4px rgba(0,0,0,0.3);">${c.unidad}</div>
+        <div class="driver-avatar" style="width: 36px; height: 36px; border-radius: 50%; background: #1a1f3a; border: 2px solid #ef4444; box-shadow: 0 3px 6px rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; overflow: hidden; transform: translateY(-2px);">${fotoHTML}</div>
+      </div>
+    `,
+    className: '',
+    iconSize: [40, 50],
+    iconAnchor: [20, 45],
+    popupAnchor: [0, -45]
+  });
+}
+
+window.activarGPSConductor = function (id) {
+  const cond = conductoresRegistrados.find(c => c.id === id);
+  if (!cond) return;
+
+  if (watchIdsConductores[id]) {
+    navigator.geolocation.clearWatch(watchIdsConductores[id]);
+    delete watchIdsConductores[id];
+    delete ubicacionesUsuarios[cond.telefono];
+    guardarUbicaciones();
+    actualizarTodosLosMarcadores();
+    actualizarAdminDatos();
+    log(`📡 GPS Desactivado para conductor ${cond.nombre}`);
+    return;
+  }
+
+  if (!navigator.geolocation) {
+    alert('GPS no soportado en este dispositivo.');
+    return;
+  }
+
+  log(`📡 Iniciando GPS para conductor ${cond.nombre}...`);
+
+  watchIdsConductores[id] = navigator.geolocation.watchPosition((pos) => {
+    const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+    ubicacionesUsuarios[cond.telefono] = loc;
+    guardarUbicaciones();
+    actualizarTodosLosMarcadores();
+    actualizarAdminDatos();
+  }, (err) => {
+    log(`❌ Error GPS conductor ${cond.nombre}: ${err.message}`);
+  }, { enableHighAccuracy: true, timeout: 10000 });
+
+  actualizarAdminDatos();
+};
+
+
 function initApp() {
   map = L.map('map').setView([12.138, -86.28], 13);
 
@@ -1499,7 +2247,35 @@ function initApp() {
   cargarParadasEnLista();
   actualizarListaUsuarios();
   actualizarTodosLosMarcadores();
+  actualizarInterfazUsuario();
   bindEventos();
+  initFirebaseSync();
+
+  if (currentUser) {
+    setTimeout(() => {
+      activarGPSReal(true);
+    }, 400);
+  }
+
+  // Configurar paneles colapsables en la barra lateral
+  document.querySelectorAll('.sidebar .panel h3').forEach(header => {
+    header.addEventListener('click', () => {
+      header.parentElement.classList.toggle('collapsed');
+    });
+  });
+
+  // Colapsar paneles por defecto en móvil (excepto Chat)
+  if (window.innerWidth < 768) {
+    document.querySelectorAll('.sidebar .panel').forEach(panel => {
+      const h3 = panel.querySelector('h3');
+      if (h3) {
+        const isChat = h3.textContent.toLowerCase().includes('chat');
+        if (!isChat) {
+          panel.classList.add('collapsed');
+        }
+      }
+    });
+  }
 
   setTimeout(() => {
     if (map) {
