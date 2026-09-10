@@ -36,6 +36,11 @@
           <div class="reglas-chat"><i class="fas fa-shield-alt"></i> Por favor, evita usar lenguaje ofensivo; este chat
             busca mantener un ambiente respetuoso y seguro para todos los usuarios
             para fines informativo</div>
+          <div class="chat-toolbar">
+            <button id="btnLimpiarChat" class="btn-clear-chat">
+              <i class="fas fa-trash-alt"></i> Limpiar Chat
+            </button>
+          </div>
           <div id="chatDisplay" class="chat-display">
             <div class="msg admin"><b>🚌 Central:</b> ¡Bienvenido!</div>
           </div>
@@ -67,14 +72,30 @@
         <h3><i class="fas fa-search-location"></i> Bus Cercano</h3>
         <button id="btnBusCercano" class="btn btn-cercano"><i class="fas fa-bus"></i> ¿Qué bus está más cerca?</button>
         <div id="resultadoCercano" class="resultado-card" style="display:none;">
-          <div class="titulo"><i class="fas fa-chart-line"></i> INFORMACIÓN EN TIEMPO REAL</div>
-          <div class="info-line"><i class="fas fa-bus"></i> <span id="cercanoBus">---</span></div>
-          <div class="info-line"><i class="fas fa-road"></i> <span id="cercanoDistancia">---</span></div>
-          <div class="info-line"><i class="fas fa-clock"></i> <span id="cercanoTiempo">---</span></div>
+          <div class="titulo"><i class="fas fa-route"></i> INDICACIONES DE RUTA</div>
+          
+          <div class="google-maps-card">
+            <div class="route-header">
+              <span class="route-time" id="routeTime">-- min</span>
+              <span class="route-distance" id="routeDistance">-- km</span>
+            </div>
+            
+            <div class="route-details">
+              <div class="route-street" id="routeStreet">Calculando ruta...</div>
+              <div class="route-status">Ruta a pie más rápida, tráfico habitual</div>
+            </div>
+            
+            <div class="route-actions">
+              <button id="btnSalirMasTarde" class="route-btn-sec">Salir más tarde</button>
+              <a id="btnIrAhora" href="#" target="_blank" class="route-btn-pri">Ir ahora</a>
+            </div>
+          </div>
+          
           <div class="resultado-divider"></div>
-          <div class="info-line"><i class="fas fa-map-marker-alt"></i> <strong>Parada más cercana:</strong></div>
-          <div class="info-line"><span id="paradaNombre">---</span></div>
-          <div class="info-line"><i class="fas fa-walking"></i> <span id="paradaDistancia">---</span></div>
+          <div class="info-line"><i class="fas fa-bus"></i> <span id="cercanoBus">---</span></div>
+          <div class="info-line"><i class="fas fa-clock"></i> <span id="cercanoTiempo">---</span></div>
+          <div class="info-line"><i class="fas fa-map-marker-alt"></i> <strong>Parada más cercana:</strong> <span id="paradaNombre">---</span></div>
+          <div class="info-line"><i class="fas fa-walking"></i> <strong>Distancia a parada:</strong> <span id="paradaDistancia">---</span></div>
           <div class="resultado-divider"></div>
           <div id="sugerencia" class="sugerencia"><i class="fas fa-lightbulb"></i> Calculando sugerencia...</div>
         </div>
@@ -86,7 +107,14 @@
       </div>
 
       <div class="panel">
-        <h3><i class="fas fa-map-pin"></i> Paradas</h3>
+        <h3><span><i class="fas fa-map-pin"></i> Paradas <span id="paradasCounter" class="paradas-counter-badge">39</span></span></h3>
+        <div class="buscador-paradas-wrap">
+          <i class="fas fa-search buscador-parada-icon"></i>
+          <input type="text" id="inputBuscarParada" placeholder="Buscar parada o #..." autocomplete="off" />
+          <button id="btnLimpiarBuscarParada" class="btn-clear-search" style="display:none;" title="Limpiar búsqueda">
+            <i class="fas fa-times"></i>
+          </button>
+        </div>
         <div id="listaParadas" class="lista-paradas">Cargando...</div>
       </div>
 
@@ -135,6 +163,81 @@
       </div>
 
       <div id="map"></div>
+
+      <!-- Barra superior flotante estilo Google Maps -->
+      <div id="gmNavTopBar" class="gm-top-nav" style="display:none;">
+        <button id="gmBtnBack" class="gm-back-btn" title="Cerrar guía"><i class="fas fa-arrow-left"></i></button>
+        <div class="gm-nav-destinations">
+          <span class="gm-nav-orig">Tu ubicación</span>
+          <i class="fas fa-arrow-right gm-nav-arrow"></i>
+          <span id="gmDestinoNombre" class="gm-dest-name">Mercado Mayoreo</span>
+        </div>
+        <div class="gm-evitar-wrapper">
+          <button id="gmBtnEvitar" class="gm-evitar-btn">Evitar <i class="fas fa-chevron-down"></i></button>
+          <div id="gmEvitarMenu" class="gm-evitar-dropdown" style="display:none;">
+            <label><input type="checkbox" id="chkEvitarPeajes"> Peajes</label>
+            <label><input type="checkbox" id="chkEvitarAutopistas"> Autopistas</label>
+            <label><input type="checkbox" id="chkEvitarTransbordos"> Transbordos</label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tarjeta inferior flotante estilo Google Maps -->
+      <div id="gmNavBottomCard" class="gm-bottom-card" style="display:none;">
+        <div class="gm-card-header">
+          <div class="gm-card-time-wrap">
+            <span class="gm-card-time" id="gmCardTime">3 min</span>
+            <span class="gm-card-dist" id="gmCardDist">0.5 km</span>
+          </div>
+          <button id="gmBtnCloseCard" class="gm-close-btn" title="Cerrar guía"><i class="fas fa-times"></i></button>
+        </div>
+        
+        <div class="gm-card-details">
+          <div class="gm-card-street" id="gmCardStreet">Por Pista Larreynaga Managua</div>
+          <div class="gm-card-sub" id="gmCardSub">Mejor ruta por carretera, Tráfico habitual</div>
+        </div>
+
+        <!-- Selector de Elección de Ruta: Carretera, A pie, En Bus -->
+        <div class="gm-mode-selector">
+          <button id="gmModeCarretera" class="gm-mode-pill active" title="Ir por la carretera asfaltada">
+            <i class="fas fa-road"></i> Carretera
+          </button>
+          <button id="gmModePeatonal" class="gm-mode-pill" title="Ir a pie por la acera">
+            <i class="fas fa-walking"></i> A pie
+          </button>
+          <button id="gmModeBus" class="gm-mode-pill" title="Seguir la ruta de bus">
+            <i class="fas fa-bus"></i> Bus 110
+          </button>
+        </div>
+        
+        <div class="gm-card-actions">
+          <button id="gmBtnSalirTarde" class="gm-btn-sec">Salir más tarde</button>
+          <button id="gmBtnIrAhora" class="gm-btn-pri"><i class="fas fa-location-arrow"></i> Ir ahora</button>
+        </div>
+      </div>
+
+      <!-- Panel de Navegación GPS Guiada en Vivo (HUD) -->
+      <div id="gmNavigationHUD" class="gm-nav-hud" style="display:none;">
+        <div class="gm-hud-instruction-card">
+          <div class="gm-hud-icon"><i id="gmHudTurnIcon" class="fas fa-arrow-up"></i></div>
+          <div class="gm-hud-text">
+            <div class="gm-hud-maneuver" id="gmHudManeuver">Camina recto hacia el destino</div>
+            <div class="gm-hud-street" id="gmHudStreet">Por Pista Larreynaga</div>
+          </div>
+        </div>
+        <div class="gm-hud-bottom-bar">
+          <div class="gm-hud-stats">
+            <span class="gm-hud-time" id="gmHudTime">12 min</span>
+            <span class="gm-hud-dot">·</span>
+            <span class="gm-hud-dist" id="gmHudDist">850 m</span>
+            <span class="gm-hud-dot">·</span>
+            <span class="gm-hud-eta" id="gmHudEta">10:45</span>
+          </div>
+          <button id="gmBtnDetenerNav" class="gm-hud-stop-btn" title="Detener navegación">
+            <i class="fas fa-times"></i> Salir
+          </button>
+        </div>
+      </div>
 
       <div id="telemetryPanel" class="telemetry-panel">
         <div class="telemetry-header" id="toggleTelemetry">

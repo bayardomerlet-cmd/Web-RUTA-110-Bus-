@@ -16,6 +16,7 @@ let ubicacionesUsuarios = {};
 let paradasMarkers = [];
 let rutaPolyline = null;
 let guidRutaPolyline = null;
+let guidRutaLayerGroup = null;
 let velocidadFactor = 1;
 let busActivoParada = null;
 let audioContext = null;
@@ -26,6 +27,7 @@ let vozElegida = null;
 let vocesDisponibles = [];
 let mostrarRuta = true;
 let historialRecorridos = [];
+let paradaGuiaActual = null;
 
 let mensajesLocales = [
   { perfil: "Central", mensaje: "¡Bienvenido! Usa el botón para ver bus y parada más cercanos.", timestamp: Date.now(), alias: "Central" }
@@ -174,6 +176,15 @@ function cargarDatos() {
   if (hist) historialRecorridos = JSON.parse(hist);
   const cond = localStorage.getItem('ruta110_conductores');
   if (cond) conductoresRegistrados = JSON.parse(cond);
+  if (!conductoresRegistrados || conductoresRegistrados.length === 0) {
+    conductoresRegistrados = [
+      { id: 'cond_1', nombre: 'Carlos Mendoza', identidad: '001-120585-0021K', unidad: '110-U01', placa: 'M 245-891', telefono: '8876-5432' },
+      { id: 'cond_2', nombre: 'Roberto Gómez', identidad: '001-230988-0044B', unidad: '110-U02', placa: 'M 198-432', telefono: '8765-4321' },
+      { id: 'cond_3', nombre: 'Manuel Silva', identidad: '001-140280-0012L', unidad: '110-U03', placa: 'M 312-765', telefono: '8654-3210' },
+      { id: 'cond_4', nombre: 'Franklin Morales', identidad: '001-050692-0033M', unidad: '110-U04', placa: 'M 104-582', telefono: '8943-2109' }
+    ];
+    guardarConductores();
+  }
   const sonidoOn = localStorage.getItem('ruta110_sonido_on');
   sonidoHabilitado = sonidoOn !== 'false';
 
@@ -385,7 +396,8 @@ function crearIconoBus(idx) {
     html: `<div class="bus-wrapper"><div class="bus-label-top">${getBusNombre(idx)}</div><div class="bus-body"></div></div>`,
     className: '',
     iconSize: [60, 68],
-    iconAnchor: [30, 44]
+    iconAnchor: [30, 44],
+    popupAnchor: [0, -45]
   });
 }
 
@@ -585,9 +597,8 @@ function actualizarTodosLosMarcadores() {
         markersUsuarios[u.telefono] = marker;
       }
 
-      // Si es el usuario activo, abrir popup y actualizar referencia
+      // Actualizar referencia del marcador del usuario activo
       if (esActivo) {
-        markersUsuarios[u.telefono].openPopup();
         userMarker = markersUsuarios[u.telefono];
       }
     }
@@ -653,21 +664,80 @@ function abrirCambioUsuario() {
   document.getElementById('cambiarUsuarioModal')?.classList.add('active');
 }
 
+function centrarRuta() {
+  if (!map) return;
+  if (rutaPolyline) {
+    map.fitBounds(rutaPolyline.getBounds(), { padding: [40, 40] });
+  } else if (paradasRuta110.length > 0) {
+    const coords = paradasRuta110.map(p => [p.lat, p.lng]);
+    map.fitBounds(L.latLngBounds(coords), { padding: [40, 40] });
+  }
+}
+
 function cargarParadasEnMapa() {
   paradasMarkers = [];
   paradasRuta110.forEach((p, idx) => {
     const marker = L.marker([p.lat, p.lng], { icon: crearIconoParada(false) }).addTo(map);
-    marker.bindPopup(p.nombre);
+    marker.bindPopup(`
+      <div style="text-align:center; padding: 2px;">
+        <b style="color:#0284c7;">Parada ${p.id}:</b> ${p.nombre}<br>
+        <button onclick="guiarHaciaParada(paradasRuta110[${idx}], true)" class="btn btn-primary" style="margin-top:6px; font-size:0.68rem; padding:4px 10px; width:100%; border-radius:14px; background:#6200ea;">
+          <i class="fas fa-walking"></i> Guiar por calles
+        </button>
+      </div>
+    `);
     paradasMarkers[idx] = marker;
   });
+
+  // Trazado exacto que une las paradas de la Ruta 110
   const rutaCoords = paradasRuta110.map(p => [p.lat, p.lng]);
+  if (rutaPolyline && map.hasLayer(rutaPolyline)) {
+    map.removeLayer(rutaPolyline);
+  }
   rutaPolyline = L.polyline(rutaCoords, {
     color: '#00d2ff',
     weight: 5,
-    opacity: 0.85,
-    dashArray: '8,10',
-    lineCap: 'round'
-  }).addTo(map);
+    opacity: 0.9,
+    dashArray: '8, 10',
+    lineCap: 'round',
+    lineJoin: 'round'
+  });
+
+  if (mostrarRuta) {
+    rutaPolyline.addTo(map);
+  }
+
+  // Ajustar en segundo plano para que siga las curvas de las calles reales de Managua
+  cargarTrazadoCallesRuta();
+}
+
+async function cargarTrazadoCallesRuta() {
+  try {
+    const batchSize = 15;
+    let allRoadCoords = [];
+    
+    for (let i = 0; i < paradasRuta110.length - 1; i += (batchSize - 1)) {
+      const slice = paradasRuta110.slice(i, i + batchSize);
+      if (slice.length < 2) break;
+      const coordsStr = slice.map(p => `${p.lng},${p.lat}`).join(';');
+      const url = `https://router.project-osrm.org/route/v1/driving/${coordsStr}?overview=full&geometries=geojson&continue_straight=true`;
+      
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.code === 'Ok' && data.routes && data.routes[0]?.geometry?.coordinates) {
+          const latlngs = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+          allRoadCoords.push(...latlngs);
+        }
+      }
+    }
+
+    if (allRoadCoords.length > 0 && rutaPolyline) {
+      rutaPolyline.setLatLngs(allRoadCoords);
+    }
+  } catch (err) {
+    console.warn("Trazado básico de paradas activo:", err);
+  }
 }
 
 function actualizarGlobosPorBuses() {
@@ -682,7 +752,7 @@ function actualizarGlobosPorBuses() {
         const el = marker.getElement();
         if (el) el.classList.add('pin-verde');
         if (marker.getTooltip()) marker.closeTooltip();
-        marker.bindTooltip(` ${getBusNombre(idxBus)} llegó a ${parada.nombre}`, {
+        marker.bindTooltip(`${parada.nombre}`, {
           permanent: false,
           direction: 'top',
           className: 'tooltip-parada',
@@ -694,7 +764,7 @@ function actualizarGlobosPorBuses() {
           if (el) el.classList.remove('pin-verde');
         }, 2000);
         reproducirSonidoParada(parada.nombre);
-        log(` ${getBusNombre(idxBus)} llegó a ${parada.nombre}`);
+        log(`Llegó a: ${parada.nombre}`);
         const noti = document.getElementById('notificacion');
         if (noti && !userLocation) noti.innerHTML = ` Simulación activa`;
         break;
@@ -702,6 +772,99 @@ function actualizarGlobosPorBuses() {
     }
   });
 }
+
+function obtenerConductorPorUnidad(busNombre) {
+  if (!conductoresRegistrados || conductoresRegistrados.length === 0) return null;
+  const nombreNormalizado = String(busNombre).trim().toLowerCase();
+  const numUnidadLimpio = String(busNombre).replace(/[^0-9]/g, '');
+
+  return conductoresRegistrados.find(c => {
+    if (!c.unidad) return false;
+    const condUnidad = String(c.unidad).trim().toLowerCase();
+    if (condUnidad === nombreNormalizado) return true;
+    const condNumLimpio = String(c.unidad).replace(/[^0-9]/g, '');
+    if (condNumLimpio && numUnidadLimpio && (parseInt(condNumLimpio, 10) === parseInt(numUnidadLimpio, 10))) return true;
+    return false;
+  }) || null;
+}
+
+function generarPopupBus(bus, idx) {
+  const busNombre = bus.nombre || getBusNombre(idx);
+  const conductor = obtenerConductorPorUnidad(busNombre);
+  const siguiente = (bus.indexRuta + 1) % circuitoCompleto.length;
+  const proxParada = circuitoCompleto[siguiente];
+  const paradaNombre = proxParada ? proxParada.nombre : "En recorrido";
+  const distancia = proxParada ? calcularDistancia(bus.lat, bus.lng, proxParada.lat, proxParada.lng) : 0;
+  const distanciaTexto = distancia < 500 ? `${Math.round(distancia)} m` : `${(distancia / 1000).toFixed(1)} km`;
+
+  let conductorHTML = '';
+  if (conductor) {
+    conductorHTML = `
+      <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px; padding-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.12);">
+        ${conductor.foto ? 
+          `<img src="${conductor.foto}" style="width:48px; height:48px; border-radius:50%; object-fit:cover; border:2px solid #00d2ff; box-shadow:0 2px 10px rgba(0,210,255,0.35);">` : 
+          `<div style="width:48px; height:48px; border-radius:50%; background:linear-gradient(135deg, #1e293b, #334155); display:flex; align-items:center; justify-content:center; border:2px solid #00d2ff; box-shadow:0 2px 10px rgba(0,210,255,0.3);"><i class="fas fa-user-tie" style="color:#00d2ff; font-size:1.35rem;"></i></div>`
+        }
+        <div>
+          <div style="font-size:0.62rem; color:#94a3b8; text-transform:uppercase; letter-spacing:0.5px; font-weight:700;">Conductor Asignado</div>
+          <div style="font-size:0.88rem; font-weight:700; color:#ffffff; line-height:1.2;">${conductor.nombre}</div>
+          <div style="font-size:0.72rem; color:#38bdf8; margin-top:3px; display:flex; align-items:center; gap:4px;">
+            <i class="fas fa-phone-alt"></i> <a href="tel:${conductor.telefono}" style="color:#38bdf8; text-decoration:none; font-weight:600;">${conductor.telefono}</a>
+          </div>
+        </div>
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:0.68rem; margin-bottom:8px;">
+        <div style="background:rgba(255,255,255,0.06); padding:5px 8px; border-radius:6px;">
+          <span style="color:#94a3b8; display:block; font-size:0.60rem;">🏷️ Placa</span>
+          <b style="color:#f8fafc; font-size:0.72rem;">${conductor.placa || 'N/A'}</b>
+        </div>
+        <div style="background:rgba(255,255,255,0.06); padding:5px 8px; border-radius:6px;">
+          <span style="color:#94a3b8; display:block; font-size:0.60rem;">🪪 ID / Cédula</span>
+          <b style="color:#f8fafc; font-size:0.72rem;">${conductor.identidad || 'N/A'}</b>
+        </div>
+      </div>
+    `;
+  } else {
+    conductorHTML = `
+      <div style="background:rgba(239,68,68,0.1); border:1px dashed rgba(239,68,68,0.4); border-radius:8px; padding:10px; text-align:center; margin-bottom:10px;">
+        <div style="color:#fca5a5; font-size:0.76rem; font-weight:700;"><i class="fas fa-user-slash"></i> Sin conductor asignado</div>
+        <div style="color:#94a3b8; font-size:0.62rem; margin-top:3px;">Asigna un conductor a <b>${busNombre}</b> desde el panel de Administración.</div>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="custom-bus-popup-content" style="color:#f8fafc; font-family:'Inter', sans-serif; min-width:220px; max-width:270px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+        <span style="background:linear-gradient(135deg, #00d2ff, #0072ff); color:#ffffff; font-weight:800; font-size:0.78rem; padding:3px 9px; border-radius:12px; display:inline-flex; align-items:center; gap:5px; box-shadow:0 2px 8px rgba(0,210,255,0.35);">
+          <i class="fas fa-bus"></i> ${busNombre}
+        </span>
+        <span style="font-size:0.65rem; color:#10b981; font-weight:700; background:rgba(16,185,129,0.15); padding:2px 7px; border-radius:10px; border:1px solid rgba(16,185,129,0.3);">
+          <i class="fas fa-circle" style="font-size:0.45rem;"></i> En Ruta 110
+        </span>
+      </div>
+      ${conductorHTML}
+      <div style="background:rgba(0,0,0,0.3); border-radius:8px; padding:7px 9px; font-size:0.68rem; color:#cbd5e1; border:1px solid rgba(255,255,255,0.06);">
+        <div style="display:flex; justify-content:space-between; margin-bottom:2px;">
+          <span><i class="fas fa-map-marker-alt" style="color:#ef4444;"></i> <b>Próximo punto:</b></span>
+          <span style="color:#38bdf8; font-weight:600;">${distanciaTexto}</span>
+        </div>
+        <div style="color:#f1f5f9; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${paradaNombre}</div>
+      </div>
+    </div>
+  `;
+}
+
+window.enfocarYMostrarBus = function(idx) {
+  if (!arregloBuses || !arregloBuses[idx]) return;
+  const bus = arregloBuses[idx];
+  map.setView([bus.lat, bus.lng], Math.max(map.getZoom(), 16), { animate: true });
+  setTimeout(() => {
+    if (bus.marker) {
+      bus.marker.openPopup();
+    }
+  }, 300);
+};
 
 function crearBus(idx, pos, rutaIndex) {
   const marker = L.marker([pos.lat, pos.lng], { icon: crearIconoBus(idx) }).addTo(map);
@@ -726,6 +889,12 @@ function crearBus(idx, pos, rutaIndex) {
       origenNombre: origenNombreInicial
     }
   };
+
+  marker.bindPopup(() => generarPopupBus(bus, idx), {
+    className: 'bus-leaflet-popup',
+    closeButton: true,
+    autoPan: true
+  });
 
   setTimeout(() => {
     const el = marker.getElement();
@@ -836,11 +1005,132 @@ function detenerSimulacion() {
   log('⏹ Simulación detenida');
 }
 
-function cargarParadasEnLista() {
-  const lista = document.getElementById('listaParadas');
-  if (!lista) return;
-  lista.innerHTML = paradasRuta110.map(p => `<div class="parada-item" onclick="map.setView([${p.lat}, ${p.lng}], 16)">${p.id}. ${p.nombre}</div>`).join('');
+let paradaSeleccionadaId = null;
+
+function normalizarTexto(txt) {
+  return (txt || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
 }
+
+function cargarParadasEnLista(filtro = '') {
+  const lista = document.getElementById('listaParadas');
+  const counterEl = document.getElementById('paradasCounter');
+  const btnClear = document.getElementById('btnLimpiarBuscarParada');
+  if (!lista) return;
+
+  const rawQuery = (filtro || '').trim();
+  const query = normalizarTexto(rawQuery);
+
+  if (btnClear) {
+    btnClear.style.display = rawQuery.length > 0 ? 'flex' : 'none';
+  }
+
+  const paradasFiltradas = paradasRuta110.filter(p => {
+    if (!query) return true;
+    const nombreNorm = normalizarTexto(p.nombre);
+    const idStr = String(p.id);
+    return nombreNorm.includes(query) || idStr === query || (`parada ${idStr}`).includes(query);
+  });
+
+  if (counterEl) {
+    counterEl.textContent = query ? `${paradasFiltradas.length}/${paradasRuta110.length}` : `${paradasRuta110.length}`;
+  }
+
+  if (paradasFiltradas.length === 0) {
+    lista.innerHTML = `
+      <div style="padding: 16px 8px; text-align: center; color: #94a3b8; font-size: 0.68rem;">
+        <i class="fas fa-search-location" style="font-size: 1.3rem; color: #64748b; display: block; margin-bottom: 6px;"></i>
+        <span>No se encontraron paradas para "<b>${rawQuery.replace(/</g, '&lt;')}</b>"</span>
+      </div>
+    `;
+    return;
+  }
+
+  lista.innerHTML = paradasFiltradas.map(p => {
+    let nombreHTML = p.nombre;
+    if (query) {
+      const nombreNorm = normalizarTexto(p.nombre);
+      const startIdx = nombreNorm.indexOf(query);
+      if (startIdx !== -1) {
+        const matched = p.nombre.substr(startIdx, rawQuery.length);
+        nombreHTML = p.nombre.substring(0, startIdx) + `<mark class="search-highlight">${matched}</mark>` + p.nombre.substring(startIdx + rawQuery.length);
+      }
+    }
+
+    const esSeleccionada = paradaSeleccionadaId === p.id;
+
+    return `
+      <div class="parada-item ${esSeleccionada ? 'selected-parada' : ''}" onclick="seleccionarParadaGuia(${p.id})">
+        <div style="display:flex; justify-content:space-between; align-items:center; width:100%; gap: 6px;">
+          <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><b>${p.id}.</b> ${nombreHTML}</span>
+          <button type="button" class="btn-parada-guiar" onclick="event.stopPropagation(); guiarParadaDirecto(${p.id})" title="Trazar ruta hacia esta parada">
+            <i class="fas fa-walking"></i> Guiar
+          </button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+window.seleccionarParadaGuia = function (id) {
+  const parada = paradasRuta110.find(p => p.id === id);
+  if (!parada) return;
+  paradaSeleccionadaId = id;
+  const idx = paradasRuta110.findIndex(p => p.id === id);
+
+  // Actualizar clase activa en la lista
+  document.querySelectorAll('.parada-item').forEach(el => el.classList.remove('selected-parada'));
+  const items = document.querySelectorAll('.parada-item');
+  items.forEach(it => {
+    if (it.getAttribute('onclick')?.includes(`(${id})`)) {
+      it.classList.add('selected-parada');
+    }
+  });
+
+  if (map) {
+    map.flyTo([parada.lat, parada.lng], 16, { duration: 0.8 });
+    if (paradasMarkers[idx]) {
+      setTimeout(() => {
+        paradasMarkers[idx].openPopup();
+      }, 400);
+    }
+  }
+
+  if (userLocation) {
+    guiarHaciaParada(parada, true);
+    log(`🚶 Guía trazada por calles hacia parada: ${parada.nombre}`);
+  } else {
+    log(`📍 Parada seleccionada: ${parada.nombre}`);
+  }
+};
+
+window.guiarParadaDirecto = function (id) {
+  const parada = paradasRuta110.find(p => p.id === id);
+  if (!parada) return;
+  paradaSeleccionadaId = id;
+  const idx = paradasRuta110.findIndex(p => p.id === id);
+
+  if (map) {
+    map.flyTo([parada.lat, parada.lng], 16, { duration: 0.8 });
+    if (paradasMarkers[idx]) {
+      setTimeout(() => {
+        paradasMarkers[idx].openPopup();
+      }, 400);
+    }
+  }
+
+  guiarHaciaParada(parada, true);
+  log(`🚶 Guía trazada hacia parada: ${parada.nombre}`);
+};
+
+window.limpiarBuscadorParadas = function () {
+  const input = document.getElementById('inputBuscarParada');
+  if (input) {
+    input.value = '';
+    input.focus();
+  }
+  cargarParadasEnLista('');
+};
+
 
 function reproducirSonidoParada(paradaNombre) {
   if (!sonidoHabilitado) return;
@@ -877,14 +1167,642 @@ function reproducirSonidoParada(paradaNombre) {
   }
 }
 
-function buscarInfoCompleta() {
-  if (!userLocation) { alert(' Primero activa tu GPS'); return; }
-  if (!simActive || arregloBuses.length === 0) { alert(' No hay buses en simulación'); return; }
+function obtenerCalleParada(nombre) {
+  if (nombre.includes("Mayoreo") || nombre.includes("Howard") || nombre.includes("Mairena") || nombre.includes("Gutiérrez") || nombre.includes("contilito") || nombre.includes("UniPlaza")) {
+    return "Por Pista Larreynaga Managua";
+  }
+  if (nombre.includes("Sabana Grande") || nombre.includes("Bismark") || nombre.includes("curva")) {
+    return "Por Pista Sabana Grande Managua";
+  }
+  if (nombre.includes("Rubenia")) {
+    return "Por Paso a Desnivel Rubenia Managua";
+  }
+  if (nombre.includes("Huembes") || nombre.includes("Jenny") || nombre.includes("Nicarao")) {
+    return "Por Pista Solidaridad Managua";
+  }
+  if (nombre.includes("Altamira") || nombre.includes("Hospital Manolo Morales") || nombre.includes("Valle") || nombre.includes("Avon")) {
+    return "Por Pista de La Resistencia Managua";
+  }
+  if (nombre.includes("UCA") || nombre.includes("ENEL") || nombre.includes("Periodista") || nombre.includes("Julio Martínez") || nombre.includes("Zumen") || nombre.includes("Nejapa") || nombre.includes("7 Sur") || nombre.includes("Piedrecitas") || nombre.includes("Embajada")) {
+    return "Por Pista Juan Pablo II Managua";
+  }
+  if (nombre.includes("Miraflores") || nombre.includes("Murillo") || nombre.includes("Seminario") || nombre.includes("UCEM") || nombre.includes("INVUR") || nombre.includes("SOS")) {
+    return "Por Calle Miraflores Managua";
+  }
+  return "Por Pista Sabana Grande Managua";
+}
+
+let coordenadasRutaActiva = [];
+let navegacionEnVivoActiva = false;
+let intervaloNavegacion = null;
+let modoGuiaActual = 'carretera'; // 'carretera', 'peatonal', 'bus'
+
+function crearIconoBanderaCuadros() {
+  return L.divIcon({
+    html: `
+      <div class="gm-flag-pin-wrapper">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 42" width="32" height="42">
+          <defs>
+            <filter id="gmShadow" x="-20%" y="-20%" width="140%" height="140%">
+              <feDropShadow dx="0" dy="3" stdDeviation="2.5" flood-color="#000000" flood-opacity="0.45"/>
+            </filter>
+            <pattern id="flagChecker" width="6" height="6" patternUnits="userSpaceOnUse">
+              <rect width="3" height="3" fill="#111827"/>
+              <rect x="3" width="3" height="3" fill="#ffffff"/>
+              <rect y="3" width="3" height="3" fill="#ffffff"/>
+              <rect x="3" y="3" width="3" height="3" fill="#111827"/>
+            </pattern>
+          </defs>
+          <path d="M 16 2 C 8.27 2, 2 8.27, 2 16 C 2 25.5, 16 40, 16 40 C 16 40, 30 25.5, 30 16 C 30 8.27, 23.73 2, 16 2 Z" fill="#ffffff" stroke="#1e293b" stroke-width="1.2" filter="url(#gmShadow)" />
+          <circle cx="16" cy="16" r="10" fill="url(#flagChecker)" stroke="#0f172a" stroke-width="1.2"/>
+        </svg>
+      </div>
+    `,
+    className: '',
+    iconSize: [32, 42],
+    iconAnchor: [16, 40],
+    popupAnchor: [0, -38]
+  });
+}
+
+function crearIconoUsuarioPulsante() {
+  return L.divIcon({
+    html: `
+      <div class="gm-user-pulse-marker">
+        <div class="gm-pulse-ring"></div>
+        <div class="gm-user-dot"></div>
+      </div>
+    `,
+    className: '',
+    iconSize: [28, 28],
+    iconAnchor: [14, 14]
+  });
+}
+
+function crearIconoBadgeRuta(mins, distMts, modo = 'carretera') {
+  const distTxt = distMts < 1000 ? `${Math.round(distMts)}m` : `${(distMts / 1000).toFixed(1)}km`;
+  
+  if (modo === 'carretera') {
+    return L.divIcon({
+      html: `
+        <div class="gm-route-eta-badge">
+          <div class="gm-eta-time">${mins} min</div>
+          <div class="gm-eta-sub">Carretera</div>
+          <div class="gm-eta-arrow"></div>
+        </div>
+      `,
+      className: '',
+      iconSize: [64, 42],
+      iconAnchor: [32, 42]
+    });
+  }
+
+  if (modo === 'bus') {
+    return L.divIcon({
+      html: `
+        <div class="gm-route-eta-badge" style="background:#0284c7;">
+          <div class="gm-eta-time">${mins} min</div>
+          <div class="gm-eta-sub">Bus 110</div>
+          <div class="gm-eta-arrow" style="border-top-color:#0284c7;"></div>
+        </div>
+      `,
+      className: '',
+      iconSize: [64, 42],
+      iconAnchor: [32, 42]
+    });
+  }
+
+  // Peatonal / A pie
+  return L.divIcon({
+    html: `
+      <div class="gm-walking-badge">
+        <div class="gm-walking-badge-top">
+          <i class="fas fa-walking"></i> <span>${mins} min</span>
+        </div>
+        <div class="gm-walking-badge-dist">${distTxt}</div>
+        <div class="gm-walking-badge-arrow"></div>
+      </div>
+    `,
+    className: '',
+    iconSize: [72, 48],
+    iconAnchor: [36, 48]
+  });
+}
+
+function cambiarModoGuia(nuevoModo) {
+  modoGuiaActual = nuevoModo;
+
+  const btnCarretera = document.getElementById('gmModeCarretera');
+  const btnPeatonal = document.getElementById('gmModePeatonal');
+  const btnBus = document.getElementById('gmModeBus');
+
+  if (btnCarretera) btnCarretera.classList.toggle('active', nuevoModo === 'carretera');
+  if (btnPeatonal) btnPeatonal.classList.toggle('active', nuevoModo === 'peatonal');
+  if (btnBus) btnBus.classList.toggle('active', nuevoModo === 'bus');
+
+  const subEl = document.getElementById('gmCardSub');
+  if (subEl) {
+    if (nuevoModo === 'carretera') subEl.textContent = "Mejor ruta por carretera, Tráfico habitual";
+    else if (nuevoModo === 'peatonal') subEl.textContent = "Ruta a pie por la acera más rápida";
+    else if (nuevoModo === 'bus') subEl.textContent = "Trayecto oficial de la Ruta 110";
+  }
+
+  if (paradaGuiaActual) {
+    guiarHaciaParada(paradaGuiaActual, false);
+  }
+}
+window.cambiarModoGuia = cambiarModoGuia;
+
+function cerrarGuiaRuta() {
+  detenerNavegacionEnVivo();
+
+  if (guidRutaLayerGroup && map) {
+    map.removeLayer(guidRutaLayerGroup);
+    guidRutaLayerGroup = null;
+  }
+  if (guidRutaPolyline && map) {
+    map.removeLayer(guidRutaPolyline);
+    guidRutaPolyline = null;
+  }
+  paradaGuiaActual = null;
+  coordenadasRutaActiva = [];
+
+  const topNav = document.getElementById('gmNavTopBar');
+  if (topNav) topNav.style.display = 'none';
+
+  const bottomCard = document.getElementById('gmNavBottomCard');
+  if (bottomCard) bottomCard.style.display = 'none';
+
+  const resCont = document.getElementById('resultadoCercano');
+  if (resCont) resCont.style.display = 'none';
+
+  const menuEvitar = document.getElementById('gmEvitarMenu');
+  if (menuEvitar) menuEvitar.style.display = 'none';
+
+  log(' Guía de ruta cerrada');
+}
+window.cerrarGuiaRuta = cerrarGuiaRuta;
+
+/**
+ * Inicia la navegación GPS / paso a paso interactiva directamente dentro de la aplicación.
+ */
+function iniciarNavegacionEnVivo() {
+  if (!paradaGuiaActual || !coordenadasRutaActiva || coordenadasRutaActiva.length < 2) {
+    alert("Selecciona primero una parada para iniciar la navegación.");
+    return;
+  }
+
+  navegacionEnVivoActiva = true;
+
+  // Cerrar cualquier popup abierto en el mapa para no tapar al usuario
+  if (map) map.closePopup();
+
+  // Ocultar tarjetas de vista previa y mostrar únicamente el HUD limpio de navegación
+  const topNav = document.getElementById('gmNavTopBar');
+  if (topNav) topNav.style.display = 'none';
+
+  const bottomCard = document.getElementById('gmNavBottomCard');
+  if (bottomCard) bottomCard.style.display = 'none';
+
+  const resCont = document.getElementById('resultadoCercano');
+  if (resCont) resCont.style.display = 'none';
+
+  // Minimizar panel de telemetría para despejar el mapa
+  const telemetryContent = document.getElementById('telemetryContent');
+  const toggleIcon = document.getElementById('toggleIcon');
+  if (telemetryContent) telemetryContent.style.display = 'none';
+  if (toggleIcon) toggleIcon.className = 'fas fa-chevron-down';
+
+  const hud = document.getElementById('gmNavigationHUD');
+  if (hud) hud.style.display = 'flex';
+
+  const calleNombre = obtenerCalleParada(paradaGuiaActual.nombre);
+  const destNombre = paradaGuiaActual.nombre;
+
+  // Actualizar textos del HUD
+  const elManeuver = document.getElementById('gmHudManeuver');
+  if (elManeuver) {
+    elManeuver.textContent = modoGuiaActual === 'carretera'
+      ? `Avanza por la carretera hacia ${destNombre}`
+      : (modoGuiaActual === 'bus' ? `En trayecto hacia ${destNombre}` : `Camina recto hacia ${destNombre}`);
+  }
+
+  const elStreet = document.getElementById('gmHudStreet');
+  if (elStreet) elStreet.textContent = calleNombre;
+
+  const totalPuntos = coordenadasRutaActiva.length;
+  const pInicio = coordenadasRutaActiva[0];
+  const pFin = coordenadasRutaActiva[totalPuntos - 1];
+  const distTotal = calcularDistancia(pInicio[0], pInicio[1], pFin[0], pFin[1]);
+  const factorVelocidad = modoGuiaActual === 'carretera' ? 300 : (modoGuiaActual === 'bus' ? 250 : 80);
+  const minsTotal = Math.max(1, Math.round(distTotal / factorVelocidad));
+
+  // Hora estimada de llegada (ETA)
+  const ahora = new Date();
+  ahora.setMinutes(ahora.getMinutes() + minsTotal);
+  const horaEta = ahora.toLocaleTimeString('es-NI', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+  const elTime = document.getElementById('gmHudTime');
+  if (elTime) elTime.textContent = `${minsTotal} min`;
+
+  const elDist = document.getElementById('gmHudDist');
+  if (elDist) elDist.textContent = distTotal < 1000 ? `${Math.round(distTotal)} m` : `${(distTotal / 1000).toFixed(1)} km`;
+
+  const elEta = document.getElementById('gmHudEta');
+  if (elEta) elEta.textContent = horaEta;
+
+  // Voz de guiado
+  if ('speechSynthesis' in window && sonidoHabilitado) {
+    speechSynthesis.cancel();
+    const modoTexto = modoGuiaActual === 'carretera' ? 'por la carretera' : (modoGuiaActual === 'bus' ? 'en bus' : 'a pie');
+    const msg = new SpeechSynthesisUtterance(`Iniciando navegación ${modoTexto} hacia ${destNombre}. Avanza por ${calleNombre}.`);
+    msg.lang = 'es-ES';
+    msg.rate = 0.95;
+    setTimeout(() => speechSynthesis.speak(msg), 150);
+  }
+
+  // Centrar y acercar el mapa en modo navegación
+  map.setView(pInicio, 17);
+
+  // Iniciar animación y seguimiento paso a paso en vivo
+  if (intervaloNavegacion) clearInterval(intervaloNavegacion);
+
+  let puntoActualIdx = 0;
+  intervaloNavegacion = setInterval(() => {
+    if (!navegacionEnVivoActiva) {
+      clearInterval(intervaloNavegacion);
+      return;
+    }
+
+    if (puntoActualIdx < totalPuntos) {
+      const pos = coordenadasRutaActiva[puntoActualIdx];
+      
+      // Actualizar posición del usuario
+      userLocation = { lat: pos[0], lng: pos[1] };
+      if (userMarker) userMarker.setLatLng(pos);
+      map.panTo(pos, { animate: true, duration: 0.6 });
+
+      // Calcular distancia restante al destino
+      const distRestante = calcularDistancia(pos[0], pos[1], pFin[0], pFin[1]);
+      const minsRestantes = Math.max(1, Math.round(distRestante / factorVelocidad));
+
+      if (elDist) elDist.textContent = distRestante < 1000 ? `${Math.round(distRestante)} m` : `${(distRestante / 1000).toFixed(1)} km`;
+      if (elTime) elTime.textContent = `${minsRestantes} min`;
+
+      puntoActualIdx++;
+    } else {
+      // Llegada al destino
+      clearInterval(intervaloNavegacion);
+      intervaloNavegacion = null;
+      if (elManeuver) elManeuver.textContent = `¡Has llegado a tu parada!`;
+      if (elDist) elDist.textContent = `0 m`;
+      if (elTime) elTime.textContent = `0 min`;
+
+      if ('speechSynthesis' in window && sonidoHabilitado) {
+        const msgFin = new SpeechSynthesisUtterance(`¡Has llegado a tu destino: ${destNombre}!`);
+        msgFin.lang = 'es-ES';
+        speechSynthesis.speak(msgFin);
+      }
+
+      setTimeout(() => {
+        detenerNavegacionEnVivo();
+      }, 3000);
+    }
+  }, 1200);
+
+  log(`🚗 Navegación (${modoGuiaActual}) en vivo iniciada hacia ${destNombre}`);
+}
+window.iniciarNavegacionEnVivo = iniciarNavegacionEnVivo;
+
+function detenerNavegacionEnVivo() {
+  navegacionEnVivoActiva = false;
+  if (intervaloNavegacion) {
+    clearInterval(intervaloNavegacion);
+    intervaloNavegacion = null;
+  }
+
+  const hud = document.getElementById('gmNavigationHUD');
+  if (hud) hud.style.display = 'none';
+
+  const topNav = document.getElementById('gmNavTopBar');
+  if (topNav && paradaGuiaActual) topNav.style.display = 'flex';
+
+  const bottomCard = document.getElementById('gmNavBottomCard');
+  if (bottomCard && paradaGuiaActual) bottomCard.style.display = 'block';
+
+  if (guidRutaPolyline && map) {
+    map.fitBounds(guidRutaPolyline.getBounds(), { padding: [60, 60] });
+  }
+
+  log(` Navegación en vivo detenida`);
+}
+window.detenerNavegacionEnVivo = detenerNavegacionEnVivo;
+
+function densificarCoordenadas(puntos, pasoMetros = 10) {
+  if (!puntos || puntos.length < 2) return puntos || [];
+  const res = [puntos[0]];
+  for (let i = 0; i < puntos.length - 1; i++) {
+    const p1 = puntos[i];
+    const p2 = puntos[i + 1];
+    const dist = calcularDistancia(p1[0], p1[1], p2[0], p2[1]);
+    const numPasos = Math.max(1, Math.floor(dist / pasoMetros));
+    for (let j = 1; j <= numPasos; j++) {
+      const f = j / numPasos;
+      res.push([
+        p1[0] + (p2[0] - p1[0]) * f,
+        p1[1] + (p2[1] - p1[1]) * f
+      ]);
+    }
+  }
+  return res;
+}
+
+/**
+ * Traza una ruta en el mapa siguiendo con precisión milimétrica el trazado real de las calles o carretera usando OSRM.
+ * @param {Object|Array} origen - Coordenadas de inicio: {lat, lng} o [lat, lng]
+ * @param {Object|Array} destino - Coordenadas de destino: {lat, lng} o [lat, lng]
+ * @param {Object} [opciones] - Configuración opcional (modo, fitBounds, destinoNombre)
+ * @returns {Promise<{polyline: L.Polyline, coordinates: Array, distance: number, duration: number}>}
+ */
+async function dibujarRutaSegunCalles(origen, destino, opciones = {}) {
+  if (!map || !origen || !destino) {
+    console.warn("dibujarRutaSegunCalles: mapa o coordenadas no disponibles");
+    return null;
+  }
+
+  const origLat = Array.isArray(origen) ? origen[0] : (origen.lat ?? origen.latitude);
+  const origLng = Array.isArray(origen) ? origen[1] : (origen.lng ?? origen.longitude);
+  const destLat = Array.isArray(destino) ? destino[0] : (destino.lat ?? destino.latitude);
+  const destLng = Array.isArray(destino) ? destino[1] : (destino.lng ?? destino.longitude);
+
+  if (origLat == null || origLng == null || destLat == null || destLng == null) {
+    console.error("Coordenadas inválidas para dibujarRutaSegunCalles:", origen, destino);
+    return null;
+  }
+
+  const modo = opciones.modo || modoGuiaActual || 'carretera';
+  const fitBounds = opciones.fitBounds !== false;
+  let coordinates = [];
+  let distanceMeters = 0;
+  let durationSeconds = 0;
+
+  const directDist = calcularDistancia(origLat, origLng, destLat, destLng);
+  const profile = (modo === 'peatonal') ? 'foot' : 'driving';
+  const osrmService = (modo === 'peatonal') ? 'routed-foot' : 'routed-car';
+
+  // Endpoints OSRM para seguir las calles y carreteras de OpenStreetMap
+  const urls = [
+    `https://router.project-osrm.org/route/v1/${profile}/${origLng},${origLat};${destLng},${destLat}?overview=full&geometries=geojson&steps=true&continue_straight=true`,
+    `https://routing.openstreetmap.de/${osrmService}/route/v1/${profile}/${origLng},${origLat};${destLng},${destLat}?overview=full&geometries=geojson&steps=true`,
+    `https://router.project-osrm.org/route/v1/driving/${origLng},${origLat};${destLng},${destLat}?overview=full&geometries=geojson&steps=true`
+  ];
+
+  let routeFound = false;
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      if (!response.ok) continue;
+      const data = await response.json();
+      if (data.code === 'Ok' && data.routes && data.routes.length > 0 && data.routes[0].geometry?.coordinates?.length > 1) {
+        const route = data.routes[0];
+        distanceMeters = route.distance || directDist;
+        durationSeconds = route.duration || (distanceMeters / (modo === 'carretera' ? 300 : (modo === 'bus' ? 250 : 80))) * 60;
+        // OSRM devuelve [lng, lat], Leaflet requiere [lat, lng]
+        coordinates = route.geometry.coordinates.map(coord => [coord[1], coord[0]]);
+        routeFound = true;
+        break;
+      }
+    } catch (e) {
+      console.warn("Error consultando OSRM:", url, e);
+    }
+  }
+
+  // Fallback seguro en caso de falta de conexión a internet
+  if (!routeFound || coordinates.length === 0) {
+    distanceMeters = directDist;
+    durationSeconds = (directDist / (modo === 'carretera' ? 300 : (modo === 'bus' ? 250 : 80))) * 60;
+    coordinates = [
+      [origLat, origLng],
+      [destLat, destLng]
+    ];
+  }
+
+  // Limpiar capas guía anteriores
+  if (guidRutaLayerGroup && map.hasLayer(guidRutaLayerGroup)) {
+    map.removeLayer(guidRutaLayerGroup);
+  }
+  guidRutaLayerGroup = L.layerGroup();
+
+  let lineCore = null;
+
+  if (modo === 'carretera') {
+    // 1. Trazado base blanco (borde nítido como en Google Maps)
+    const lineCasing = L.polyline(coordinates, {
+      color: '#ffffff',
+      weight: 10,
+      opacity: 0.95,
+      lineCap: 'round',
+      lineJoin: 'round'
+    });
+    guidRutaLayerGroup.addLayer(lineCasing);
+
+    // 2. Trazado morado vibrante siguiendo la carretera
+    lineCore = L.polyline(coordinates, {
+      color: '#6200ea',
+      weight: 7,
+      opacity: 1,
+      lineCap: 'round',
+      lineJoin: 'round',
+      className: 'gm-route-line-purple'
+    });
+  } else if (modo === 'bus') {
+    // Trazado en bus de la Ruta 110
+    const lineCasing = L.polyline(coordinates, {
+      color: '#ffffff',
+      weight: 9,
+      opacity: 0.9,
+      lineCap: 'round',
+      lineJoin: 'round'
+    });
+    guidRutaLayerGroup.addLayer(lineCasing);
+
+    lineCore = L.polyline(coordinates, {
+      color: '#00d2ff',
+      weight: 6,
+      opacity: 1,
+      dashArray: '8, 10',
+      lineCap: 'round',
+      lineJoin: 'round'
+    });
+  } else {
+    // Modo A pie / Peatonal (círculos punteados azules con cruce por acera e intersecciones)
+    const lineCasing = L.polyline(coordinates, {
+      color: '#93c5fd',
+      weight: 9,
+      opacity: 0.55,
+      lineCap: 'round',
+      lineJoin: 'round'
+    });
+    guidRutaLayerGroup.addLayer(lineCasing);
+
+    lineCore = L.polyline(coordinates, {
+      color: '#2563eb',
+      weight: 7,
+      opacity: 1,
+      dashArray: '0, 14',
+      lineCap: 'round',
+      lineJoin: 'round',
+      className: 'gm-walking-dotted-line'
+    });
+  }
+
+  guidRutaLayerGroup.addLayer(lineCore);
+  guidRutaPolyline = lineCore;
+  
+  // Guardar puntos densificados para que la animación recorra exactamente cada punto y curva de la calle
+  coordenadasRutaActiva = densificarCoordenadas(coordinates, 8);
+
+  // Marcador de inicio (Punto GPS azul con halo pulsante)
+  const userMarkerGuide = L.marker([origLat, origLng], {
+    icon: crearIconoUsuarioPulsante(),
+    zIndexOffset: 1000
+  });
+  guidRutaLayerGroup.addLayer(userMarkerGuide);
+
+  // Marcador de destino (Bandera a cuadros de meta)
+  const destMarker = L.marker([destLat, destLng], {
+    icon: crearIconoBanderaCuadros(),
+    zIndexOffset: 1001
+  });
+  if (opciones.destinoNombre) {
+    destMarker.bindPopup(`<b>🏁 Destino:</b> ${opciones.destinoNombre}`);
+  }
+  guidRutaLayerGroup.addLayer(destMarker);
+
+  // Badge flotante en la ruta con tiempo y distancia según el modo elegido
+  const factorMins = modo === 'carretera' ? 300 : (modo === 'bus' ? 250 : 80);
+  const mins = Math.max(1, Math.round(distanceMeters / factorMins));
+  if (coordinates.length >= 2) {
+    const midIdx = Math.floor(coordinates.length * 0.45);
+    const midPoint = coordinates[midIdx];
+    const badgeMarker = L.marker(midPoint, {
+      icon: crearIconoBadgeRuta(mins, distanceMeters, modo),
+      zIndexOffset: 999
+    });
+    guidRutaLayerGroup.addLayer(badgeMarker);
+  }
+
+  guidRutaLayerGroup.addTo(map);
+
+  // Ajustar la vista al recorrido
+  if (fitBounds && coordinates.length > 0) {
+    const bounds = L.latLngBounds(coordinates);
+    map.fitBounds(bounds, { padding: [60, 60] });
+  }
+
+  return {
+    polyline: guidRutaPolyline,
+    layerGroup: guidRutaLayerGroup,
+    coordinates: coordinates,
+    distance: distanceMeters,
+    duration: durationSeconds
+  };
+}
+window.dibujarRutaSegunCalles = dibujarRutaSegunCalles;
+
+async function guiarHaciaParada(parada, fitBounds = true) {
+  if (!parada) return null;
+  
+  // Usar ubicación GPS real si existe, o la parada anterior en la ruta que ya está en la carretera
+  let locOrigen = userLocation;
+  if (!locOrigen) {
+    const idx = paradasRuta110.findIndex(p => p.id === parada.id);
+    if (idx > 0) {
+      locOrigen = { lat: paradasRuta110[idx - 1].lat, lng: paradasRuta110[idx - 1].lng };
+    } else if (idx === 0 && paradasRuta110.length > 1) {
+      locOrigen = { lat: paradasRuta110[1].lat, lng: paradasRuta110[1].lng };
+    } else {
+      locOrigen = { lat: parada.lat, lng: parada.lng };
+    }
+  }
+
+  paradaGuiaActual = parada;
+  const res = await dibujarRutaSegunCalles(locOrigen, parada, {
+    modo: modoGuiaActual,
+    fitBounds: fitBounds,
+    destinoNombre: parada.nombre
+  });
+
+  const distMetros = res && res.distance > 0 ? res.distance : calcularDistancia(locOrigen.lat, locOrigen.lng, parada.lat, parada.lng);
+  const factorMins = modoGuiaActual === 'carretera' ? 300 : (modoGuiaActual === 'bus' ? 250 : 80);
+  const mins = Math.max(1, Math.round(distMetros / factorMins));
+  const distKmTxt = distMetros < 1000 ? `${Math.round(distMetros)} m` : `${(distMetros / 1000).toFixed(1)} km`;
+  const distMtsTxt = distMetros < 1000 ? `${Math.round(distMetros)} metros` : `${(distMetros / 1000).toFixed(1)} kilómetros`;
+  const calleNombre = obtenerCalleParada(parada.nombre);
+
+  // Si estamos en navegación en vivo, mantener ocultas las tarjetas secundarias
+  if (navegacionEnVivoActiva) {
+    return res;
+  }
+
+  // Actualizar Barra Superior Flotante
+  const topNav = document.getElementById('gmNavTopBar');
+  const destName = document.getElementById('gmDestinoNombre');
+  if (topNav && destName) {
+    destName.textContent = parada.nombre;
+    topNav.style.display = 'flex';
+  }
+
+  // Actualizar Tarjeta Inferior Flotante
+  const bottomCard = document.getElementById('gmNavBottomCard');
+  const gmTime = document.getElementById('gmCardTime');
+  const gmDist = document.getElementById('gmCardDist');
+  const gmStreet = document.getElementById('gmCardStreet');
+  if (bottomCard) {
+    if (gmTime) gmTime.textContent = `${mins} min`;
+    if (gmDist) gmDist.textContent = distKmTxt;
+    if (gmStreet) gmStreet.textContent = calleNombre;
+    bottomCard.style.display = 'block';
+  }
+
+  // Sincronizar tarjeta en la barra lateral
+  const elRouteTime = document.getElementById('routeTime');
+  if (elRouteTime) elRouteTime.textContent = `${mins} min`;
+
+  const elRouteDistance = document.getElementById('routeDistance');
+  if (elRouteDistance) elRouteDistance.textContent = distKmTxt;
+
+  const elRouteStreet = document.getElementById('routeStreet');
+  if (elRouteStreet) elRouteStreet.textContent = calleNombre;
+
+  const elParadaNombre = document.getElementById('paradaNombre');
+  if (elParadaNombre) elParadaNombre.innerHTML = `<strong>${parada.nombre}</strong>`;
+
+  const elParadaDistancia = document.getElementById('paradaDistancia');
+  if (elParadaDistancia) elParadaDistancia.textContent = distMtsTxt;
+
+  const resCont = document.getElementById('resultadoCercano');
+  if (resCont) resCont.style.display = 'block';
+
+  return res;
+}
+window.guiarHaciaParada = guiarHaciaParada;
+
+async function buscarInfoCompleta() {
+  if (!simActive || arregloBuses.length === 0) {
+    alert(' Inicia primero la simulación para encontrar buses activos');
+    return;
+  }
+
+  const locOrigen = userLocation || {
+    lat: 12.1350,
+    lng: -86.1950
+  };
 
   let busCercano = null;
   let distanciaMinimaBus = Infinity;
   arregloBuses.forEach((bus, idx) => {
-    const d = calcularDistancia(userLocation.lat, userLocation.lng, bus.lat, bus.lng);
+    const d = calcularDistancia(locOrigen.lat, locOrigen.lng, bus.lat, bus.lng);
     if (d < distanciaMinimaBus) {
       distanciaMinimaBus = d;
       busCercano = { bus: getBusNombre(idx), distancia: d, idx, lat: bus.lat, lng: bus.lng };
@@ -894,48 +1812,36 @@ function buscarInfoCompleta() {
   let paradaCercana = null;
   let distanciaMinimaParada = Infinity;
   paradasRuta110.forEach(parada => {
-    const d = calcularDistancia(userLocation.lat, userLocation.lng, parada.lat, parada.lng);
+    const d = calcularDistancia(locOrigen.lat, locOrigen.lng, parada.lat, parada.lng);
     if (d < distanciaMinimaParada) {
       distanciaMinimaParada = d;
       paradaCercana = { nombre: parada.nombre, lat: parada.lat, lng: parada.lng, distancia: d };
     }
   });
 
-  const distanciaBusTexto = busCercano.distancia < 1000 ? `${Math.round(busCercano.distancia)} metros` : `${(busCercano.distancia / 1000).toFixed(1)} kilómetros`;
-  const minutosBus = Math.max(1, Math.round(busCercano.distancia / 300));
+  if (!paradaCercana) return;
+
+  const distanciaBusTexto = busCercano && busCercano.distancia < 1000 ? `${Math.round(busCercano.distancia)} metros` : `${((busCercano?.distancia || 0) / 1000).toFixed(1)} kilómetros`;
+  const minutosBus = Math.max(1, Math.round((busCercano?.distancia || 500) / 300));
   const tiempoBusTexto = `${minutosBus} minutos aprox.`;
-  const distanciaParadaTexto = paradaCercana.distancia < 1000 ? `${Math.round(paradaCercana.distancia)} metros` : `${(paradaCercana.distancia / 1000).toFixed(1)} kilómetros`;
 
-  document.getElementById('cercanoBus').innerHTML = `<strong>${busCercano.bus}</strong> (el más cercano a ti)`;
-  document.getElementById('cercanoDistancia').innerHTML = `${distanciaBusTexto} desde tu ubicación`;
-  document.getElementById('cercanoTiempo').innerHTML = `${tiempoBusTexto} de viaje estimado`;
-  document.getElementById('paradaNombre').innerHTML = `<strong>${paradaCercana.nombre}</strong>`;
-  document.getElementById('paradaDistancia').innerHTML = `${distanciaParadaTexto} desde tu ubicación`;
-  document.getElementById('sugerencia').innerHTML = `<i class="fas fa-lightbulb"></i> Puedes esperar en "${paradaCercana.nombre}".`;
-  document.getElementById('resultadoCercano').style.display = 'block';
-  const noti = document.getElementById('notificacion');
-  if (noti) noti.innerHTML = `🎯 ${busCercano.bus} a ${distanciaBusTexto} | Parada: ${paradaCercana.nombre}`;
-  log(`🎯 Bus más cercano: ${busCercano.bus}`);
+  // Activar guía visual por calles hacia la parada más cercana
+  await guiarHaciaParada(paradaCercana, true);
 
-  // Trazar línea de guía hacia la parada más cercana
-  if (guidRutaPolyline && map) {
-    map.removeLayer(guidRutaPolyline);
+  // Actualizar información del bus más cercano y sugerencia
+  if (busCercano) {
+    const cercBusEl = document.getElementById('cercanoBus');
+    if (cercBusEl) cercBusEl.innerHTML = `<strong>${busCercano.bus}</strong> (el más cercano a ti)`;
+    const cercTiempoEl = document.getElementById('cercanoTiempo');
+    if (cercTiempoEl) cercTiempoEl.innerHTML = `${tiempoBusTexto} de viaje estimado`;
   }
-  const caminoCoords = [
-    [userLocation.lat, userLocation.lng],
-    [paradaCercana.lat, paradaCercana.lng]
-  ];
-  guidRutaPolyline = L.polyline(caminoCoords, {
-    color: '#8b5cf6', // Color morado
-    weight: 4,
-    opacity: 0.85,
-    dashArray: '6, 8', // Estilo línea de puntos / camino
-    lineCap: 'round'
-  }).addTo(map);
+  
+  const sugEl = document.getElementById('sugerencia');
+  if (sugEl) sugEl.innerHTML = `<i class="fas fa-lightbulb"></i> Puedes esperar en "${paradaCercana.nombre}".`;
 
-  // Ajustar la vista del mapa para englobar al usuario y la parada cercana
-  const bounds = L.latLngBounds(caminoCoords);
-  map.fitBounds(bounds, { padding: [50, 50] });
+  const noti = document.getElementById('notificacion');
+  if (noti) noti.innerHTML = `🎯 Bus: ${busCercano?.bus || 'Ruta 110'} | Parada: ${paradaCercana.nombre}`;
+  log(`🎯 Bus más cercano: ${busCercano?.bus || '110'} | Guía por calles activada hacia ${paradaCercana.nombre}`);
 }
 
 function actualizarNotificacionProximidad() {
@@ -1027,9 +1933,17 @@ function actualizarTelemetria() {
     const proxParada = circuitoCompleto[siguiente];
     const distancia = calcularDistancia(bus.lat, bus.lng, proxParada.lat, proxParada.lng);
     const distanciaTexto = distancia < 500 ? `📏 ${Math.round(distancia)}m` : `🔄 ${(distancia / 1000).toFixed(1)}km`;
+    const cond = obtenerConductorPorUnidad(busNombre);
+    const condHTML = cond 
+      ? `<div class="unidad-conductor-tag"><i class="fas fa-user-tie" style="color:#00d2ff;"></i> <span><b>${cond.nombre}</b></span></div>` 
+      : `<div class="unidad-conductor-tag sin-asignar"><i class="fas fa-user-slash"></i> <span>Sin conductor</span></div>`;
 
-    html += `<div class="unidad-card">
-      <div class="unidad-nombre"><i class="fas fa-bus"></i> ${busNombre}</div>
+    html += `<div class="unidad-card clickable" onclick="enfocarYMostrarBus(${idx})" title="Clic para ver conductor y ubicar en el mapa">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <div class="unidad-nombre"><i class="fas fa-bus"></i> ${busNombre}</div>
+        <span class="btn-ver-unidad"><i class="fas fa-id-badge"></i> Ver Conductor</span>
+      </div>
+      ${condHTML}
       <div class="unidad-proxima"><i class="fas fa-map-marker-alt"></i> Próximo punto: ${proxParada.nombre}</div>
       <div class="unidad-distancia">${distanciaTexto}</div>
       <div class="unidad-estado estado-moviendo">🔵 En movimiento</div>
@@ -1112,9 +2026,15 @@ function activarGPSReal(ignorarConfirmacion) {
         }
         if (estadoGPS) estadoGPS.innerHTML = '📍 GPS: Activo';
         actualizarNotificacionProximidad();
+
+        // Actualizar la línea de guía por calles en tiempo real mientras camina
+        if (paradaGuiaActual) {
+          guiarHaciaParada(paradaGuiaActual, false);
+        }
       }, (e) => {
         log(`❌ GPS Watch error: ${e.message}`);
       }, { enableHighAccuracy: altaPrecision, timeout: 10000 });
+
 
     }, (err) => {
       log(`❌ GPS error inicial (altaPrecision=${altaPrecision}): ${err.message}`);
@@ -1179,55 +2099,141 @@ function cerrarYRestablecerRegistro() {
   }
 }
 
+function validarTelefono(telefono) {
+  // Eliminar guiones, espacios, paréntesis, etc.
+  const limpio = telefono.replace(/[\s\-\(\)]/g, '');
+  
+  // Formato local de Nicaragua: 8 dígitos empezando con 2, 5, 7, 8
+  const regexNicaLocal = /^[2578]\d{7}$/;
+  
+  // Formato internacional de Nicaragua: +505 o 505 seguido de 8 dígitos empezando con 2, 5, 7, 8
+  const regexNicaInt = /^(?:\+?505)?[2578]\d{7}$/;
+  
+  // Formato internacional general: empieza con + y tiene de 7 a 15 dígitos
+  const regexIntGeneral = /^\+[1-9]\d{6,14}$/;
+
+  if (regexNicaLocal.test(limpio)) {
+    return { valido: true, formateado: '+505' + limpio };
+  }
+  if (regexNicaInt.test(limpio)) {
+    const prefijo = limpio.startsWith('+') ? '' : '+';
+    return { valido: true, formateado: prefijo + limpio };
+  }
+  if (regexIntGeneral.test(limpio)) {
+    return { valido: true, formateado: limpio };
+  }
+  return { valido: false };
+}
+
 function registrarNuevoUsuario() {
   const alias = document.getElementById('userAlias')?.value.trim();
-  const telefono = document.getElementById('phoneNumber')?.value.trim();
+  const telefonoRaw = document.getElementById('phoneNumber')?.value.trim();
   const error = document.getElementById('registerError');
-  if (!alias || !telefono) {
+  const registerBtn = document.getElementById('registerBtn');
+
+  if (!alias || !telefonoRaw) {
     if (error) error.textContent = 'Completa alias y número.';
     return;
   }
+
+  // Validar teléfono
+  const resultadoTel = validarTelefono(telefonoRaw);
+  if (!resultadoTel.valido) {
+    if (error) {
+      error.textContent = 'Número inválido. Usa 8 dígitos (ej: 88888888) o formato con prefijo internacional (ej: +50588888888).';
+    }
+    return;
+  }
+  const telefono = resultadoTel.formateado;
+
   if (usuariosRegistrados.some(u => u.telefono === telefono)) {
     if (error) error.textContent = 'Ese número ya existe.';
     return;
   }
 
-  const nuevo = { alias, telefono };
-  usuariosRegistrados.push(nuevo);
-  currentUser = nuevo;
-  guardarUsuarios();
-
-  if (document.getElementById('adminPanel')?.classList.contains('active') && typeof actualizarAdminDatos === 'function') {
-    actualizarAdminDatos();
-  }
-
-  actualizarListaUsuarios();
-  actualizarInterfazUsuario();
   if (error) error.textContent = '';
-
-  // Solicitar GPS inmediatamente para no perder el contexto de gesto del usuario
-  activarGPSReal(true);
-
-  // Mostrar interfaz de éxito en el modal de registro
-  const success = document.getElementById('registerSuccess');
-  if (success) {
-    success.innerHTML = `¡Registro Exitoso!<br><span style="font-size:0.65rem; font-weight:normal; color:#cbd5e1;">Se ha solicitado acceso a tu ubicación GPS.</span>`;
-    success.style.display = 'block';
+  
+  // Deshabilitar botón de registro y mostrar estado de obtención de ubicación
+  if (registerBtn) {
+    registerBtn.disabled = true;
+    registerBtn.textContent = 'OBTENIENDO UBICACIÓN...';
   }
 
-  const ua = document.getElementById('userAlias');
-  if (ua) ua.style.display = 'none';
-
-  const pn = document.getElementById('phoneNumber');
-  if (pn) pn.style.display = 'none';
-
-  const registerBtn = document.getElementById('registerBtn');
-  if (registerBtn) registerBtn.style.display = 'none';
-
-  const cancelBtn = document.getElementById('cancelarRegistroBtn');
-  if (cancelBtn) {
-    cancelBtn.textContent = 'REGRESAR AL MAPA';
+  // Solicitar ubicación GPS antes de completar el registro
+  if (!navigator.geolocation) {
+    if (error) error.textContent = 'Tu navegador no soporta geolocalización. No se puede completar el registro.';
+    if (registerBtn) {
+      registerBtn.disabled = false;
+      registerBtn.textContent = 'REGISTRARSE';
+    }
+    return;
   }
+
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      // Éxito: tenemos ubicación del usuario
+      userLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      ubicacionesUsuarios[telefono] = userLocation;
+
+      const nuevo = { alias, telefono };
+      usuariosRegistrados.push(nuevo);
+      currentUser = nuevo;
+
+      guardarUsuarios();
+      guardarUbicaciones();
+
+      if (document.getElementById('adminPanel')?.classList.contains('active') && typeof actualizarAdminDatos === 'function') {
+        actualizarAdminDatos();
+      }
+
+      actualizarListaUsuarios();
+      actualizarInterfazUsuario();
+      actualizarTodosLosMarcadores();
+
+      // Iniciar el watchPosition continuo
+      activarGPSReal(true);
+
+      // Mostrar interfaz de éxito en el modal de registro
+      const success = document.getElementById('registerSuccess');
+      if (success) {
+        success.innerHTML = `¡Registro Exitoso!<br><span style="font-size:0.65rem; font-weight:normal; color:#cbd5e1;">Tu ubicación ha sido asociada y compartida correctamente.</span>`;
+        success.style.display = 'block';
+      }
+
+      const ua = document.getElementById('userAlias');
+      if (ua) ua.style.display = 'none';
+
+      const pn = document.getElementById('phoneNumber');
+      if (pn) pn.style.display = 'none';
+
+      if (registerBtn) {
+        registerBtn.style.display = 'none';
+        registerBtn.disabled = false;
+        registerBtn.textContent = 'REGISTRARSE';
+      }
+
+      const cancelBtn = document.getElementById('cancelarRegistroBtn');
+      if (cancelBtn) {
+        cancelBtn.textContent = 'REGRESAR AL MAPA';
+      }
+    },
+    (err) => {
+      // Error al obtener la ubicación
+      console.error("Error de geolocalización durante el registro:", err);
+      if (error) {
+        error.textContent = 'Es obligatorio permitir el acceso a tu ubicación GPS para poder registrarte. Por favor actívala en tu navegador e intenta de nuevo.';
+      }
+      if (registerBtn) {
+        registerBtn.disabled = false;
+        registerBtn.textContent = 'REGISTRARSE';
+      }
+    },
+    {
+      enableHighAccuracy: true,
+      timeout: 10000,
+      maximumAge: 0
+    }
+  );
 }
 
 function abrirAdmin() {
@@ -2054,9 +3060,24 @@ function toggleRuta() {
   }
 }
 
+function limpiarChatLocal() {
+  const confirmar = confirm("¿Deseas limpiar el historial del chat localmente en tu pantalla?");
+  if (!confirmar) return;
+
+  const chatDisplay = document.getElementById('chatDisplay');
+  if (chatDisplay) {
+    chatDisplay.innerHTML = `<div class="msg admin"><b>🚌 Central:</b> ¡Bienvenido! Pantalla de chat limpiada.</div>`;
+  }
+  mensajesLocales = [
+    { perfil: "Central", mensaje: "¡Bienvenido! Usa el botón para ver bus y parada más cercanos.", timestamp: Date.now(), alias: "Central" }
+  ];
+  loadedMsgIds.clear();
+}
+
 function bindEventos() {
   const mapaEventos = {
     sendBtn: handleSendMessage,
+    btnLimpiarChat: limpiarChatLocal,
     btnRegistroNuevo: () => document.getElementById('registerModal')?.classList.add('active'),
     registerBtn: registrarNuevoUsuario,
     cancelarRegistroBtn: cerrarYRestablecerRegistro,
@@ -2066,6 +3087,21 @@ function bindEventos() {
     btnActivarGPS: activarGPSReal,
     btnCentrarGPS: centrarEnMiUbicacion,
     btnBusCercano: buscarInfoCompleta,
+    btnSalirMasTarde: () => alert("Horarios estimados: Los buses de la Ruta 110 pasan con una frecuencia regular de cada 10 a 15 minutos en esta parada."),
+    btnIrAhora: iniciarNavegacionEnVivo,
+    gmBtnSalirTarde: () => alert("Horarios estimados: Los buses de la Ruta 110 pasan con una frecuencia regular de cada 10 a 15 minutos en esta parada."),
+    gmBtnIrAhora: iniciarNavegacionEnVivo,
+    gmBtnDetenerNav: detenerNavegacionEnVivo,
+    gmBtnBack: cerrarGuiaRuta,
+    gmBtnCloseCard: cerrarGuiaRuta,
+    gmModeCarretera: () => cambiarModoGuia('carretera'),
+    gmModePeatonal: () => cambiarModoGuia('peatonal'),
+    gmModeBus: () => cambiarModoGuia('bus'),
+    gmBtnEvitar: (e) => {
+      e.stopPropagation();
+      const menu = document.getElementById('gmEvitarMenu');
+      if (menu) menu.style.display = menu.style.display === 'none' ? 'flex' : 'none';
+    },
     btnIniciarSimulacion: () => {
       iniciarSimulacionConCantidad();
       if (simInterval) clearInterval(simInterval);
@@ -2095,6 +3131,36 @@ function bindEventos() {
       if (e.key === 'Enter') handleSendMessage();
     });
   }
+
+  const inputBuscarParada = document.getElementById('inputBuscarParada');
+  if (inputBuscarParada) {
+    inputBuscarParada.addEventListener('input', (e) => {
+      cargarParadasEnLista(e.target.value);
+    });
+    inputBuscarParada.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        window.limpiarBuscadorParadas();
+      } else if (e.key === 'Enter') {
+        const primeraParada = document.querySelector('.parada-item');
+        if (primeraParada) {
+          primeraParada.click();
+        }
+      }
+    });
+  }
+
+  const btnLimpiar = document.getElementById('btnLimpiarBuscarParada');
+  if (btnLimpiar) {
+    btnLimpiar.addEventListener('click', window.limpiarBuscadorParadas);
+  }
+
+  document.addEventListener('click', (e) => {
+    const evitarWrap = document.querySelector('.gm-evitar-wrapper');
+    const evitarMenu = document.getElementById('gmEvitarMenu');
+    if (evitarMenu && evitarWrap && !evitarWrap.contains(e.target)) {
+      evitarMenu.style.display = 'none';
+    }
+  });
 }
 
 window.previewConductorFoto = function (event) {
@@ -2276,6 +3342,16 @@ function initApp() {
       }
     });
   }
+
+  // Inicializar reloj en tiempo real
+  function actualizarReloj() {
+    const relojEl = document.getElementById('reloj');
+    if (relojEl) {
+      relojEl.textContent = new Date().toLocaleTimeString('es-NI', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+    }
+  }
+  actualizarReloj();
+  setInterval(actualizarReloj, 1000);
 
   setTimeout(() => {
     if (map) {
